@@ -3,15 +3,15 @@ import time
 import requests
 import threading
 
-# Telegram Bot Token ve Kanal Chat ID
+# Telegram Bot Bilgileri
 TELEGRAM_BOT_TOKEN = "7963189403:AAFw4xKnEeYBmGdgkyeNmHwcj5ipl2pIHsw"
 TELEGRAM_CHAT_ID = "-1002701984074"
 
-# Spor API URL ve API Key (Kendi servisine göre URL değişebilir)
-LIVE_MATCHES_API_URL = "https://api.sporapi.com/v1/live_matches"  # Örnek, gerçek URL ile değiştir
+# SportMonks API bilgileri
+SPORTMONKS_API_URL = "https://api.sportmonks.com/v3/football/livescores?include=localTeam,visitorTeam,league"
 API_KEY = "O9tROfdiu5zhZ078qc8EwUe0uepND6J98wuS5UtOBKjmdWWBULgLi90FCzeG"
 
-# Sinyalleri kaydetmek için dosya
+# Gönderilen sinyalleri takip dosyası
 SIGNALS_DB_FILE = "signals_db.json"
 
 def send_telegram_message(message):
@@ -37,13 +37,14 @@ def save_signals_db(db):
         json.dump(db, f, indent=4)
 
 def get_live_matches():
-    headers = {
-        "X-API-Key": API_KEY
+    params = {
+        "api_token": API_KEY
     }
     try:
-        response = requests.get(LIVE_MATCHES_API_URL, headers=headers)
+        response = requests.get(SPORTMONKS_API_URL, params=params)
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            return data.get("data", [])
         else:
             print("API çağrısı başarısız:", response.status_code, response.text)
             return []
@@ -52,25 +53,23 @@ def get_live_matches():
         return []
 
 def analyze_match_for_signal(match):
-    elapsed = match.get("elapsed", 0)  # Dakika
-    goals = match.get("home_goals", 0) + match.get("away_goals", 0)
+    elapsed = match.get("time", {}).get("minute", 0)
+    goals = match.get("scores", {}).get("localteam_score", 0) + match.get("scores", {}).get("visitorteam_score", 0)
 
-    # Dakika 60-70 arasında ve en az 1 gol varsa +0.5 ÜST
     if 60 <= elapsed <= 70 and goals >= 1:
         return "+0.5 ÜST"
 
-    # Dakika 0-20 arasında ve en az 1 gol varsa ilk yarı 1.5 ÜST
     if elapsed <= 20 and goals >= 1:
         return "İlk Yarı 1.5 ÜST"
 
     return None
 
 def generate_signal_message(match, bet_type):
-    home = match.get("home_team", "Bilinmiyor")
-    away = match.get("away_team", "Bilinmiyor")
-    league = match.get("league", "Lig Bilgisi Yok")
-    elapsed = match.get("elapsed", 0)
-    goals = match.get("home_goals", 0) + match.get("away_goals", 0)
+    home = match.get("localTeam", {}).get("data", {}).get("name", "Bilinmiyor")
+    away = match.get("visitorTeam", {}).get("data", {}).get("name", "Bilinmiyor")
+    league = match.get("league", {}).get("data", {}).get("name", "Lig Bilgisi Yok")
+    elapsed = match.get("time", {}).get("minute", 0)
+    goals = match.get("scores", {}).get("localteam_score", 0) + match.get("scores", {}).get("visitorteam_score", 0)
 
     emoji_new = "⚽🚀"
 
@@ -84,21 +83,19 @@ def generate_signal_message(match, bet_type):
     return message
 
 def main_loop():
-    print("Telegram bahis sinyal botu çalışıyor...")
+    print("SportMonks üzerinden sinyaller izleniyor...")
     signals_db = load_signals_db()
 
     while True:
         live_matches = get_live_matches()
         for match in live_matches:
-            match_id = str(match.get("match_id"))
+            match_id = str(match.get("id"))
             bet_type = analyze_match_for_signal(match)
 
             if bet_type is None:
                 continue
 
             signal_key = f"{match_id}-{bet_type}"
-
-            # Aynı sinyal tekrar gönderilmesin
             if signal_key in signals_db:
                 continue
 
@@ -110,7 +107,7 @@ def main_loop():
 
             message = generate_signal_message(match, bet_type)
             send_telegram_message(message)
-            print("Sinyal gönderildi:", message)
+            print("✅ Sinyal gönderildi:", message)
 
         save_signals_db(signals_db)
         time.sleep(60)
@@ -118,7 +115,7 @@ def main_loop():
 def send_periodic_message(message, interval_hours=4):
     while True:
         send_telegram_message(message)
-        print(f"Periyodik mesaj gönderildi: {message[:30]}...")
+        print("🕓 Periyodik mesaj gönderildi.")
         time.sleep(interval_hours * 3600)
 
 if __name__ == "__main__":
@@ -131,8 +128,5 @@ if __name__ == "__main__":
 🟢🟡Melbet   👉promo kodu :drpars
 https://bit.ly/drparsbet"""
 
-    # Periyodik mesajı ayrı thread’de çalıştır
     threading.Thread(target=send_periodic_message, args=(sabit_metin, 4), daemon=True).start()
-
-    # Ana sinyal döngüsünü başlat
     main_loop()
