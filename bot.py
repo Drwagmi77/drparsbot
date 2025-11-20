@@ -1,250 +1,451 @@
+import os
 import re
 import asyncio
 import logging
-import os
 import threading
 import time
+import json
+from datetime import datetime
 import random
+import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
+from telethon.tl.functions.channels import GetParticipantRequest
 from flask import Flask, jsonify, request, redirect, session, render_template_string
 import tweepy
-from datetime import datetime
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
+from asgiref.wsgi import WsgiToAsgi
 
-# ====================== X TWEET AYARLARI (2. KOD GİBİ) ======================
-TWEET_TITLES = [
-    "NEW BET ALERT", "HOT LIVE SIGNAL", "STRONG PLAY", "BANKER BET",
-    "PREMIUM TIP", "EXCLUSIVE SIGNAL", "HIGH VALUE", "MOONSHOT BET"
-]
+# ----------------------------------------------------------------------
+# 1. ORTAM DEĞİŞKENLERİ VE YAPILANDIRMA
+# ----------------------------------------------------------------------
 
-class TweetManager:
-    def __init__(self): self.i = 0
-    def get_title(self): 
-        title = TWEET_TITLES[self.i % len(TWEET_TITLES)]
-        self.i += 1
-        return title
-
-tm = TweetManager()
-
-# ====================== AYARLAR (1. KOD GİBİ) ======================
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-bot_client = TelegramClient('bot', API_ID, API_HASH)
-user_client = TelegramClient('user', API_ID, API_HASH)
-
-app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY") or os.urandom(24).hex()
-
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT", "5432")
-
-X_CONSUMER_KEY = os.getenv("X_CONSUMER_KEY")
-X_CONSUMER_SECRET = os.getenv("X_CONSUMER_SECRET")
-X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
-X_ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET")
-
-client = tweepy.Client(
-    consumer_key=X_CONSUMER_KEY,
-    consumer_secret=X_CONSUMER_SECRET,
-    access_token=X_ACCESS_TOKEN,
-    access_token_secret=X_ACCESS_TOKEN_SECRET
-) if X_CONSUMER_KEY else None
-
-DEFAULT_ADMIN_ID = int(os.getenv("DEFAULT_ADMIN_ID", "7567322437"))
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler("logs/betbot.log"), logging.StreamHandler()])
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ====================== DATABASE (1. KOD GİBİ) ======================
-def get_conn():
-    return psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT, sslmode="require")
+# Ortam değişkenlerinden çekilir
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS processed_messages(chat_id BIGINT, message_id BIGINT, PRIMARY KEY(chat_id,message_id))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS processed_signals(signal_key TEXT PRIMARY KEY)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS signal_mappings(signal_key TEXT PRIMARY KEY, target_msg_id BIGINT, tweet_id BIGINT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS channels(id SERIAL PRIMARY KEY, channel_id BIGINT UNIQUE, title TEXT, type TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY, value TEXT)""")
-    conn.commit(); conn.close()
-    logger.info("DB hazır")
+DB_HOST = os.environ.get("DB_HOST")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+DB_NAME = os.environ.get("DB_NAME")
+DB_USER = os.environ.get("DB_USER")
+DB_PASS = os.environ.get("DB_PASS")
 
-# Sync functions
-def get_channels_sync(t): 
-    conn = get_conn(); cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM channels WHERE type=%s", (t,)); r = cur.fetchall(); conn.close(); return r
-def add_channel_sync(cid, title, t): 
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("INSERT INTO channels(channel_id,title,type) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (cid,title,t))
-    conn.commit(); conn.close()
+X_CONSUMER_KEY = os.environ.get("X_CONSUMER_KEY")
+X_CONSUMER_SECRET = os.environ.get("X_CONSUMER_SECRET")
+X_ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN")
+X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET")
 
-def is_processed_sync(c,m): conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT 1 FROM processed_messages WHERE chat_id=%s AND message_id=%s",(c,m)); r=cur.fetchone(); conn.close(); return bool(r)
-def mark_processed_sync(c,m): conn=get_conn(); cur=conn.cursor(); cur.execute("INSERT INTO processed_messages VALUES(%s,%s) ON CONFLICT DO NOTHING",(c,m)); conn.commit(); conn.close()
-def is_signal_done_sync(k): conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT 1 FROM processed_signals WHERE signal_key=%s",(k,)); r=cur.fetchone(); conn.close(); return bool(r)
-def mark_signal_done_sync(k): conn=get_conn(); cur=conn.cursor(); cur.execute("INSERT INTO processed_signals VALUES(%s) ON CONFLICT DO NOTHING",(k,)); conn.commit(); conn.close()
-def get_mapping_sync(k): conn=get_conn(); cur=conn.cursor(cursor_factory=RealDictCursor); cur.execute("SELECT * FROM signal_mappings WHERE signal_key=%s",(k,)); r=cur.fetchone(); conn.close(); return dict(r) if r else None
-def save_mapping_sync(k, t_msg=None, tweet=None): 
-    conn=get_conn(); cur=conn.cursor()
-    cur.execute("""INSERT INTO signal_mappings(signal_key,target_msg_id,tweet_id) VALUES(%s,%s,%s) 
-                   ON CONFLICT(signal_key) DO UPDATE SET target_msg_id=%s, tweet_id=%s""", (k,t_msg,tweet,t_msg,tweet))
-    conn.commit(); conn.close()
+DEFAULT_ADMIN_ID = int(os.getenv("DEFAULT_ADMIN_ID", "0"))
 
-# Async wrappers
-async def get_channels(t): return await asyncio.to_thread(get_channels_sync, t)
-async def is_processed(c,m): return await asyncio.to_thread(is_processed_sync,c,m)
-async def mark_processed(c,m): await asyncio.to_thread(mark_processed_sync,c,m)
-async def is_signal_done(k): return await asyncio.to_thread(is_signal_done_sync,k)
-async def mark_signal_done(k): await asyncio.to_thread(mark_signal_done_sync,k)
-async def get_mapping(k): return await asyncio.to_thread(get_mapping_sync,k)
-async def save_mapping(k, t_msg=None, tweet=None): await asyncio.to_thread(save_mapping_sync,k,t_msg,tweet)
+# GLOBAL BUTONLAR, METİNLER VE FİLTRELER
+ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
 
-# ====================== 2 BUTON (SENİN 2. KOD GİBİ) ======================
-BETTING_BUTTONS = [
-    [Button.url("JOIN MELBET (drpars)", "https://bit.ly/drparsbet")],
-    [Button.url("JOIN 1XBET (drparsbet)", "http://bit.ly/3fAja06")]
-]
+SCHEDULED_MESSAGE = """
+✅ OUR SPONSOR SITES; 
 
-# ====================== SPONSOR MESAJ (2. KOD GİBİ) ======================
-SPONSOR_MESSAGE = """
-OUR SPONSOR SITES; 
+⛔️Click the links and register without leaving the page.
 
-Click the links and register without leaving the page.
+💯 You can reach us to join the VIP group after making your investment 👇
 
-You can reach us to join the VIP group after making your investment 
-
-MELBET → Promo Code: drpars
+🟢🟡Melbet 👉Promo Code: drpars
 https://bit.ly/drparsbet
 
-1XBET → Promo Code: drparsbet
-http://bit.ly/3fAja06
+🔴🔵1xbet 👉Promo Code: drparsbet
+bit.ly/3fAja06
 """
 
-# ====================== SİNYAL ÇIKARMA (2. KOD GİBİ) ======================
-def extract_bet(text):
-    data = {}
-    match = re.search(r'⚽ (.*?)(?:\n|$)', text)
-    data['match'] = match.group(1).strip() if match else None
-    minute = re.search(r'⏰\s*(\d+)', text)
-    data['minute'] = minute.group(1) if minute else None
-    pred = re.search(r'❗ (.*?)(?:\n|$)', text)
-    data['pred'] = pred.group(1).strip() if pred else None
-    code = re.search(r'AlertCode:\s*(\d+)', text)
-    data['code'] = code.group(1) if code else None
-    
-    result = re.search(r'(✅|❌)', text)
-    data['result'] = result.group(1) if result else None
-    final = re.search(r'#⃣ FT (\d+ - \d+)', text)
-    data['final'] = final.group(1) if final else None
+BETTING_BUTTONS = [
+    [
+        Button.url("JOIN MELBET (drpars)", "https://bit.ly/drparsbet"),
+        Button.url("JOIN 1XBET (drparsbet)", "http://bit.ly/3fAja06")
+    ]
+]
 
-    if data['match'] and data['minute'] and data['pred']:
-        key = f"{data['match']}_{data['minute']}_{data['pred']}".replace(' ', '_')
-        data['key'] = re.sub(r'[^\w]', '', key)[:100]
-        return data
-    return None
+# Client ve Flask tanımları
+bot_client = TelegramClient('bot', API_ID, API_HASH)
+user_client = TelegramClient('user', API_ID, API_HASH)
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24).hex()
 
-# ====================== MESAJ ŞABLONLARI (2. KOD GİBİ) ======================
-def build_message(data):
-    return f"""⚽ {data['match']}
-{data['minute']}. min
-{data['pred']}"""
+# X Client (Hata yönetimi ile)
+client = None
+try:
+    if X_CONSUMER_KEY:
+        client = tweepy.Client(
+            consumer_key=X_CONSUMER_KEY,
+            consumer_secret=X_CONSUMER_SECRET,
+            access_token=X_ACCESS_TOKEN,
+            access_token_secret=X_ACCESS_TOKEN_SECRET
+        )
+except Exception as e:
+    logger.error(f"X Client Init Error: {e}")
 
-def build_edit(result):
-    return "\n\n🟢 RESULT: WON! 🎉" if result == '✅' else "\n\n🔴 RESULT: LOST! 😔"
+bot_running = True 
 
-def build_reply(data):
-    match = data['match'].split(' (')[0]
-    if data['result'] == '✅':
-        return f"🟢 RESULT: WON!\n\n{match}: {data['final']}\n\nBet WON! Like this tweet to celebrate!"
-    else:
-        return f"🔴 RESULT: LOST!\n\n{match}: {data['final']}\n\nWe'll be back stronger!"
+# Flask Login HTML Formları
+LOGIN_FORM = """<!doctype html><title>Login</title><h2>Phone</h2><form method=post><input name=phone placeholder="+90..." required><button>Send Code</button></form>"""
+CODE_FORM = """<!doctype html><title>Code</title><h2>Enter Code</h2><form method=post><input name=code placeholder=12345 required><button>Login</button></form>"""
 
-# ====================== X TWEET (2. KOD GİBİ) ======================
-def post_tweet(text, reply_to=None):
-    if not client: return None
+# ----------------------------------------------------------------------
+# 2. VERİTABANI YÖNETİMİ (POSTGRESQL - SENKRON)
+# ----------------------------------------------------------------------
+
+def get_connection():
+    """Yeni bağlantı alır."""
     try:
-        resp = client.create_tweet(text=text[:280], in_reply_to_tweet_id=reply_to) if reply_to else client.create_tweet(text=text[:280])
-        return resp.data['id']
-    except: return None
+        return psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+            host=DB_HOST,
+            port=DB_PORT,
+            sslmode="require"
+        )
+    except psycopg2.OperationalError as e:
+        logger.error(f"Database connection failed: {e}")
+        raise e
 
-# ====================== ANA HANDLER (1. KOD + 2. KOD HARMANI) ======================
-@user_client.on(events.NewMessage(chats=[c["channel_id"] for c in get_channels_sync("source")]))
-async def handler(event):
-    if await is_processed(event.chat_id, event.id): return
-    await mark_processed(event.chat_id, event.id)
+def init_db_sync():
+    """ZORUNLU TABLOLARIN BAŞLATILMASI"""
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # 1. Sinyal Takip Tablosu
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_signals (
+                signal_key TEXT PRIMARY KEY,
+                source_channel TEXT NOT NULL,
+                target_message_id BIGINT,
+                tweet_id BIGINT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        
+        # 2. Kanal Tablosu (Eski yapı uyumluluğu için)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                id SERIAL PRIMARY KEY,
+                channel_id BIGINT UNIQUE,
+                title TEXT,
+                channel_type TEXT
+            );
+        """)
+        
+        conn.commit()
+        logger.info("✅ DB tabloları hazır.")
+    except Exception as e:
+        logger.error(f"Error during database initialization: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
 
-    data = extract_bet(event.message.message or "")
-    if not data or not data['key']: return
+def get_signal_data(signal_key):
+    """Sinyal verisini alır."""
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT target_message_id, tweet_id FROM processed_signals 
+                WHERE signal_key = %s AND target_message_id IS NOT NULL AND tweet_id IS NOT NULL
+            """, (signal_key,))
+            result = cur.fetchone()
+            return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Error checking signal data: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
-    # AlertCode filtresi (admin panelden değiştirilebilir)
-    allowed = (await get_bot_setting("allowed_codes") or "1,17,21,32,41,48").split(",")
-    if data.get('code') and data['code'] not in allowed: return
+def record_processed_signal(signal_key, target_message_id, tweet_id):
+    """Yeni işlenen sinyali kaydeder veya günceller."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO processed_signals (signal_key, source_channel, target_message_id, tweet_id) 
+                VALUES (%s, %s, %s, %s) 
+                ON CONFLICT (signal_key) DO UPDATE SET 
+                target_message_id = EXCLUDED.target_message_id, 
+                tweet_id = EXCLUDED.tweet_id;
+            """, (signal_key, "source", target_message_id, tweet_id))
+            conn.commit()
+            logger.info(f"Signal recorded: {signal_key}")
+            return True
+    except Exception as e:
+        logger.error(f"Error recording signal: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
-    if data['result']:  # SONUÇ GELDİ
-        mapping = await get_mapping(data['key'])
-        if not mapping: return
+def get_channels_sync(t): 
+    """Kanal ID'lerini çeker."""
+    conn=get_connection()
+    cur=conn.cursor(cursor_factory=RealDictCursor)
+    
+    source_id = os.getenv("SOURCE_CHANNEL")
+    target_id = os.getenv("TARGET_CHANNEL")
+    
+    channels = []
+    if t == 'source' and source_id:
+        channels.append({"channel_id": int(source_id) if source_id.startswith('-100') else source_id})
+    elif t == 'target' and target_id:
+        channels.append({"channel_id": int(target_id) if target_id.startswith('-100') else target_id})
 
-        # Telegram edit
+    conn.close()
+    return channels
+
+# ----------------------------------------------------------------------
+# 3. SİNYAL ÇIKARMA VE ŞABLONLAMA
+# ----------------------------------------------------------------------
+
+def extract_bet_data(message_text):
+    data = {}
+    # Regex ile veri çekme
+    match_score_match = re.search(r'⚽ (.*?)\s*\(.*?\)', message_text, re.DOTALL)
+    data['maç_skor'] = match_score_match.group(0).strip().replace('⚽ ', '') if match_score_match else None
+    
+    lig_match = re.search(r'🏟 (.*?)\n', message_text)
+    data['lig'] = lig_match.group(1).strip() if lig_match else None
+    
+    dakika_match = re.search(r'⏰ (\d+)\s*', message_text)
+    data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
+    
+    tahmin_match = re.search(r'❗ (.*?)\n', message_text)
+    # Parantez içindeki İngilizce kısmı al
+    tahmin_en_match = re.search(r'\((.*?)\)', tahmin_match.group(1)) if tahmin_match and '(' in tahmin_match.group(1) else tahmin_match
+    data['tahmin'] = tahmin_en_match.group(1).strip() if tahmin_en_match else (tahmin_match.group(1).strip() if tahmin_match else None)
+    
+    alert_code_match = re.search(r'👉 AlertCode: (\d+)', message_text)
+    data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
+
+    result_match = re.match(r'([✅❌])', message_text.strip())
+    data['result_icon'] = result_match.group(1) if result_match else None
+
+    final_score_match = re.search(r'#⃣ FT (\d+ - \d+)', message_text)
+    data['final_score'] = final_score_match.group(1).strip() if final_score_match else None
+
+    # Benzersiz anahtar oluştur
+    if all([data.get('maç_skor'), data.get('dakika'), data.get('tahmin')]):
+        maç_temiz = re.sub(r'[\(\)]', '', data['maç_skor']).strip().replace(' ', '_').replace('-', '')
+        tahmin_temiz = re.sub(r'[^\w\s]', '', data['tahmin']).strip().replace(' ', '_')
+        data['signal_key'] = f"{maç_temiz}_{data['dakika']}_{tahmin_temiz}"
+    else:
+        data['signal_key'] = None
+    
+    return data if data['signal_key'] else None
+
+def build_telegram_message(data):
+    return f"""
+{data['maç_skor']}
+{data['lig']}
+{data['dakika']}. min
+{data['tahmin']}
+"""
+
+def build_x_tweet(data):
+    return f"""
+{data['maç_skor']} | {data['dakika']}. min
+{data['tahmin']}
+"""
+
+def build_telegram_edit(result_icon):
+    if result_icon == '✅': return "\n\n🟢 RESULT: WON! 🎉"
+    elif result_icon == '❌': return "\n\n🔴 RESULT: LOST! 😔"
+    return ""
+
+def build_x_reply_tweet(data):
+    maç_adı = data['maç_skor'].split(' (')[0].strip()
+    if data['result_icon'] == '✅':
+        result_text = "🟢 RESULT: WON! 🎉"
+        call_to_action = "Bet WON! Like this tweet to celebrate!"
+    elif data['result_icon'] == '❌':
+        result_text = "🔴 RESULT: LOST! 😔"
+        call_to_action = "Bet LOST. We'll be back stronger!"
+    else:
+        return None
+    return f"""
+{result_text}
+
+{maç_adı}: {data['final_score']}
+
+{call_to_action}
+"""
+
+def post_to_x_sync(tweet_text, reply_to_id=None):
+    """
+    X'e tweet atar. Tamamen SENKRON'dur, await içermez.
+    """
+    try:
+        if not client: 
+            logger.warning("X client not initialized.")
+            return None
+        
+        if reply_to_id:
+            response = client.create_tweet(text=tweet_text, in_reply_to_tweet_id=reply_to_id)
+            logger.info(f"X Reply Sent: {response.data['id']}")
+        else:
+            response = client.create_tweet(text=tweet_text)
+            logger.info(f"X Tweet Sent: {response.data['id']}")
+            
+        return response.data['id']
+    except Exception as e:
+        logger.error(f"X post error: {e}")
+        return None
+
+# ----------------------------------------------------------------------
+# 4. HANDLER (LOGIC)
+# ----------------------------------------------------------------------
+
+async def channel_handler(event):
+    if not bot_running: return
+    message_text = event.raw_text.strip()
+    data = await asyncio.to_thread(extract_bet_data, message_text)
+    
+    if not data or not data['signal_key']: return
+
+    is_result = data['result_icon'] is not None
+    signal_key = data['signal_key']
+    target_channel_id = os.environ.get("TARGET_CHANNEL")
+    
+    # ID'yi integer'a çevirmeyi dene
+    try:
+        target_int = int(target_channel_id)
+    except:
+        target_int = target_channel_id
+
+    if is_result:
+        # --- SONUÇ İŞLEME ---
+        signal_record = await asyncio.to_thread(get_signal_data, signal_key)
+        if signal_record:
+            target_message_id = signal_record.get('target_message_id')
+            tweet_id = signal_record.get('tweet_id')
+            
+            # Telegram Edit
+            try:
+                original_msg = await bot_client.get_messages(target_int, ids=target_message_id)
+                if original_msg:
+                    new_text = original_msg.message + build_telegram_edit(data['result_icon'])
+                    await bot_client.edit_message(target_int, target_message_id, text=new_text, buttons=BETTING_BUTTONS)
+                    logger.info("Telegram message edited.")
+            except Exception as e: logger.error(f"Edit error: {e}")
+            
+            # X Reply
+            x_reply = build_x_reply_tweet(data)
+            if x_reply and tweet_id:
+                await asyncio.to_thread(post_to_x_sync, x_reply, tweet_id)
+    else:
+        # --- YENİ SİNYAL ---
+        if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
+        if await asyncio.to_thread(get_signal_data, signal_key): return
+
+        logger.info(f"New Signal: {signal_key}")
+
+        # X'e Tweet At
+        tweet_id = await asyncio.to_thread(post_to_x_sync, build_x_tweet(data))
+        
+        # Telegram'a Mesaj At
         try:
-            await bot_client.edit_message(
-                entity=mapping['target_msg_id'],
-                message=mapping['target_msg_id'],
-                text=await bot_client.get_messages(None, ids=mapping['target_msg_id']).then(lambda m: m.message) + build_edit(data['result']),
-                buttons=BETTING_BUTTONS
-            )
-        except: pass
+            sent = await bot_client.send_message(target_int, build_telegram_message(data), buttons=BETTING_BUTTONS)
+            # DB'ye Kaydet
+            await asyncio.to_thread(record_processed_signal, signal_key, sent.id, tweet_id)
+        except Exception as e: logger.error(f"Send error: {e}")
 
-        # X reply
-        if mapping.get('tweet_id'):
-            reply_text = build_reply(data)
-            post_tweet(reply_text, reply_to=mapping['tweet_id'])
+# ----------------------------------------------------------------------
+# 5. ZAMANLANMIŞ GÖREV
+# ----------------------------------------------------------------------
 
-    else:  # YENİ SİNYAL
-        if await is_signal_done(data['key']): return
-        await mark_signal_done(data['key'])
-
-        msg_text = build_message(data)
-        tweet_text = f"{tm.get_title()}\n\n⚽ {data['match']} | {data['minute']}. min\n{data['pred']}"
-
-        tweet_id = post_tweet(tweet_text)
-
-        targets = await get_channels("target")
-        target_msg_id = None
-        for ch in targets:
-            sent = await bot_client.send_message(ch["channel_id"], msg_text, buttons=BETTING_BUTTONS, file=await get_bot_setting("custom_gif"))
-            if not target_msg_id: target_msg_id = sent.id
-
-        await save_mapping(data['key'], target_msg_id, tweet_id)
-
-# ====================== 4 SAATTE BİR SPONSOR (2. KOD GİBİ) ======================
-async def sponsor_task():
+async def scheduled_post_task():
+    interval = 4 * 60 * 60
+    await asyncio.sleep(10) 
+    target = os.environ.get("TARGET_CHANNEL")
+    try:
+        target = int(target)
+    except:
+        pass
+        
     while True:
-        await asyncio.sleep(4*60*60)
-        targets = await get_channels("target")
-        for ch in targets:
-            await bot_client.send_message(ch["channel_id"], SPONSOR_MESSAGE, buttons=BETTING_BUTTONS)
+        if bot_running and bot_client.is_connected():
+            try:
+                await bot_client.send_message(target, SCHEDULED_MESSAGE, parse_mode='Markdown')
+                logger.info("Auto-promo sent.")
+            except Exception as e: logger.error(f"Auto post error: {e}")
+        await asyncio.sleep(interval)
 
-# ====================== ADMIN PANEL + LOGIN + MAIN (1. KOD GİBİ) ======================
-# Tam admin paneli, pause, kanal ekle-çıkar, GIF değiştir, X aç/kapa, AlertCode değiştir → hepsi var
-# /login, hypercorn, self-ping → aynı
+# ----------------------------------------------------------------------
+# 6. FLASK ROTALARI
+# ----------------------------------------------------------------------
 
-async def main():
-    init_db()
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        phone = request.form.get('phone', '').strip()
+        session['phone'] = phone
+        try:
+            # Flask thread'inden ana bot loop'una görev gönder
+            asyncio.run_coroutine_threadsafe(user_client.connect(), user_client.loop).result()
+            asyncio.run_coroutine_threadsafe(user_client.send_code_request(phone), user_client.loop).result()
+            return redirect('/submit-code')
+        except Exception as e: return f"Error: {e}"
+    return render_template_string(LOGIN_FORM)
+
+@app.route('/submit-code', methods=['GET', 'POST'])
+def submit_code():
+    if request.method == 'POST':
+        code = request.form.get('code', '').strip()
+        try:
+            asyncio.run_coroutine_threadsafe(user_client.sign_in(session['phone'], code), user_client.loop).result()
+            return "Login Successful! You can close this page."
+        except Exception as e: return f"Error: {e}"
+    return render_template_string(CODE_FORM)
+
+@app.route('/health')
+def health(): return jsonify(status="ok"), 200
+
+# ----------------------------------------------------------------------
+# 7. BAŞLATMA MANTIĞI
+# ----------------------------------------------------------------------
+
+async def main_bot_runner():
+    # DB Başlat
+    await asyncio.to_thread(init_db_sync)
+    
+    # Clientları Başlat
     await bot_client.start(bot_token=BOT_TOKEN)
-    await user_client.connect()
-    asyncio.create_task(sponsor_task())
-    logger.info("BAHİS BOTU ÇALIŞIYOR — 1. KOD GİBİ SAĞLAM + 2. KOD GİBİ DAVRANIYOR")
-    await asyncio.Event().wait()
+    await user_client.start()
+    logger.info("Clients started.")
+    
+    # Handler'ı Ekle (DB hazır olduktan sonra)
+    source_ids = [c['channel_id'] for c in get_channels_sync('source')]
+    user_client.add_event_handler(channel_handler, events.NewMessage(incoming=True, chats=source_ids))
+    logger.info(f"Handler attached for: {source_ids}")
+    
+    asyncio.create_task(scheduled_post_task())
+    await user_client.run_until_disconnected()
 
 if __name__ == '__main__':
-    threading.Thread(target=lambda: asyncio.run(main()), daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 5000)))
+    asgi_app = WsgiToAsgi(app)
+    config = Config()
+    config.bind = [f"0.0.0.0:{int(os.environ.get('PORT', '5000'))}"]
+    
+    async def runner():
+        await asyncio.gather(
+            serve(asgi_app, config),
+            main_bot_runner()
+        )
+    
+    try:
+        asyncio.run(runner())
+    except KeyboardInterrupt:
+        pass
