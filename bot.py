@@ -8,6 +8,9 @@ import tweepy
 import psycopg2
 from psycopg2 import pool, extras
 from flask import Flask, jsonify, request, session, redirect, render_template_string
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
+from asgiref.wsgi import WsgiToAsgi # <<< EKSİK OLAN KRİTİK IMPORT EKLENDİ
 import time
 
 # ----------------------------------------------------------------------
@@ -17,7 +20,7 @@ import time
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-API_ID = int(os.getenv('API_ID'))
+API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
@@ -83,9 +86,8 @@ telethon_ready = False
 bot_running = True
 
 # ----------------------------------------------------------------------
-# 2. SENKRON VERİTABANI YARDIMCILARI (KRİTİK)
+# 2. VERİTABANI YÖNETİMİ
 # ----------------------------------------------------------------------
-
 def get_connection():
     """Yeni bağlantı alır."""
     try:
@@ -102,20 +104,13 @@ def get_connection():
         raise e
 
 def get_channels_sync(channel_type):
-    """
-    Kanal listesini senkron olarak çeker.
-    Telethon handler'ları başlatılırken buna ihtiyacımız var.
-    """
+    """Kanal listesini senkron olarak çeker."""
     conn = None
     try:
         conn = get_connection()
         with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
-            # NOTE: Channels tablosu init_db'de oluşturulmamış, bu yüzden basit bir DB query kullanıldı.
-            # Ancak biz bu mimaride sadece signal_key tablosunu kullanıyoruz.
-            # Güvenli olması için, bu fonksiyonun boş bir liste döndürmesine izin veriyoruz.
             cur.execute("SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'channels'")
             if cur.fetchone() is None:
-                # Eğer channels tablosu yoksa boş liste dön
                 return []
                 
             cur.execute("SELECT channel_id FROM channels WHERE channel_type = %s", (channel_type,))
@@ -128,9 +123,6 @@ def get_channels_sync(channel_type):
         if conn:
             conn.close()
 
-# ----------------------------------------------------------------------
-# 3. VERİTABANI YÖNETİMİ
-# ----------------------------------------------------------------------
 def init_db_pool():
     global pg_pool
     try:
@@ -153,7 +145,6 @@ def init_db():
     if conn:
         try:
             with conn.cursor() as cur:
-                # KRİTİK: Bu tablolar, handler'ın çalışması için gereklidir.
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS processed_signals (
                         signal_key TEXT PRIMARY KEY,
@@ -172,7 +163,6 @@ def init_db():
                         is_default BOOLEAN DEFAULT FALSE
                     );
                 """)
-                # Handler'ın bağımlı olduğu eski channel tablosu da ekleniyor
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS channels (
                         id SERIAL PRIMARY KEY,
@@ -188,8 +178,6 @@ def init_db():
             logging.error(f"Veritabanı başlatma hatası: {e}")
         finally:
             pg_pool.putconn(conn)
-# ... (get_signal_data, record_processed_signal fonksiyonları buraya dahildir)
-# ... (Diğer DB fonksiyonları yer kazanmak için kısaltılmıştır, tam kodda mevcuttur)
 
 def get_signal_data(signal_key):
     """Verilen signal_key'e ait mesaj ID ve Tweet ID'sini getirir."""
@@ -232,34 +220,42 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
             conn.close()
 
 # ----------------------------------------------------------------------
-# 4. VERİ ÇIKARMA VE ŞABLONLAMA
+# 3. VERİ ÇIKARMA VE ŞABLONLAMA
 # ----------------------------------------------------------------------
-# ... (extract_bet_data, build_telegram_message, build_x_tweet, build_telegram_edit, build_x_reply_tweet fonksiyonları aynı kalır)
-# YER KAZANMAK İÇİN BU BÖLÜM KISALTILMIŞTIR
 
 def extract_bet_data(message_text):
+    """Bahis sinyalinden ve sonuçtan gerekli verileri Regex ile çıkarır."""
     data = {}
+    
     match_score_match = re.search(r'⚽ (.*?)\s*\(.*?\)', message_text, re.DOTALL)
     data['maç_skor'] = match_score_match.group(0).strip().replace('⚽ ', '') if match_score_match else None
+    
     lig_match = re.search(r'🏟 (.*?)\n', message_text)
     data['lig'] = lig_match.group(1).strip() if lig_match else None
+    
     dakika_match = re.search(r'⏰ (\d+)\s*', message_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
+    
     tahmin_match = re.search(r'❗ (.*?)\n', message_text)
     tahmin_en_match = re.search(r'\((.*?)\)', tahmin_match.group(1)) if tahmin_match and '(' in tahmin_match.group(1) else tahmin_match
     data['tahmin'] = tahmin_en_match.group(1).strip() if tahmin_en_match else (tahmin_match.group(1).strip() if tahmin_match else None)
+    
     alert_code_match = re.search(r'👉 AlertCode: (\d+)', message_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
+
     result_match = re.match(r'([✅❌])', message_text.strip())
     data['result_icon'] = result_match.group(1) if result_match else None
+
     final_score_match = re.search(r'#⃣ FT (\d+ - \d+)', message_text)
     data['final_score'] = final_score_match.group(1).strip() if final_score_match else None
+
     if all([data.get('maç_skor'), data.get('dakika'), data.get('tahmin')]):
         maç_temiz = re.sub(r'[\(\)]', '', data['maç_skor']).strip().replace(' ', '_').replace('-', '')
         tahmin_temiz = re.sub(r'[^\w\s]', '', data['tahmin']).strip().replace(' ', '_')
         data['signal_key'] = f"{maç_temiz}_{data['dakika']}_{tahmin_temiz}"
     else:
         data['signal_key'] = None
+    
     return data if data['signal_key'] else None
 
 def build_telegram_message(data):
@@ -288,7 +284,9 @@ def build_telegram_edit(result_icon):
 
 def build_x_reply_tweet(data):
     """X (Twitter) yanıt tweet'i için final şablonu (İngilizce)"""
+    
     maç_adı = data['maç_skor'].split(' (')[0].strip()
+    
     if data['result_icon'] == '✅':
         result_text = "🟢 RESULT: WON! 🎉"
         call_to_action = "Bet WON! Like this tweet to celebrate!"
@@ -297,6 +295,7 @@ def build_x_reply_tweet(data):
         call_to_action = "Bet LOST. We'll be back stronger!"
     else:
         return None
+
     return f"""
 {result_text}
 
@@ -312,7 +311,6 @@ def post_to_x_sync(tweet_text, reply_to_id=None):
             logger.warning("X anahtarları eksik! Tweet atılamıyor.")
             return None
         
-        # Orijinal mimariden gelen client kullanılır
         client_instance = tweepy.Client(
             consumer_key=X_CONSUMER_KEY,
             consumer_secret=X_CONSUMER_SECRET,
@@ -409,7 +407,7 @@ async def channel_handler(event):
         # X'e (Twitter) Post Et
         tweet_id = await asyncio.to_thread(post_to_x_sync, x_tweet)
         
-        # Telegram'a Post Et
+        # 5. Telegram'a Post Et
         try:
             sent_message = await bot_client.send_message(
                 entity=TARGET_CHANNEL,
@@ -421,7 +419,7 @@ async def channel_handler(event):
         except Exception as e:
             logger.error(f"Telegram post hatası: {e}")
             
-        # Veritabanına Kaydet
+        # 6. Veritabanına Kaydet
         await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
 
 # ----------------------------------------------------------------------
@@ -461,7 +459,7 @@ async def scheduled_post_task():
         await asyncio.sleep(interval)
 
 # ----------------------------------------------------------------------
-# 7. YÖNETİM VE FLASK ROTALARI (GÜNCELLENMİŞ)
+# 7. YÖNETİM VE FLASK ROTALARI
 # ----------------------------------------------------------------------
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -473,7 +471,6 @@ async def login():
             return "<p>Phone number is required.</p>", 400
         session['phone'] = phone
         try:
-            # Orijinal mimari login'i (AsyncIO'yu kendi içinde yönetir)
             await user_client.connect()
             await user_client.send_code_request(phone)
             logger.info(f"Sent login code request to {phone}")
@@ -540,6 +537,10 @@ async def main_bot_runner():
 
 if __name__ == '__main__':
     # Flask app'i ASGI'ye çevir
+    from hypercorn.asyncio import serve
+    from hypercorn.config import Config
+    from asgiref.wsgi import WsgiToAsgi
+    
     asgi_app = WsgiToAsgi(app)
     config = Config()
     
@@ -549,19 +550,15 @@ if __name__ == '__main__':
     config.errorlog = '-'
     
     async def runner():
-        # Hypercorn sunucusunu ayrı bir task olarak başlat
         server_task = asyncio.create_task(serve(asgi_app, config))
         logger.info("Hypercorn server task created.")
         
-        # Bot görevini ayrı bir task olarak başlat
         bot_task = asyncio.create_task(main_bot_runner())
         logger.info("Main bot task created.")
         
-        # İki task'ı aynı anda bekle (Bu, sistemin kilitlenmeden çalışmasını sağlar)
         await asyncio.gather(server_task, bot_task)
         
     try:
-        # Ana loop'u başlat
         asyncio.run(runner())
     except KeyboardInterrupt:
         logger.info("Bot interrupted by user. Shutting down.")
