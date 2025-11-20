@@ -7,7 +7,7 @@ from telethon import TelegramClient, events, Button
 import tweepy
 import psycopg2
 from psycopg2 import pool
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, session, redirect, render_template_string
 import time
 
 # ----------------------------------------------------------------------
@@ -62,16 +62,37 @@ BETTING_BUTTONS = [
     ]
 ]
 
+# Flask Login HTML Formları
+LOGIN_FORM = """<!doctype html>
+<title>Telegram Login</title>
+<h2>Step 1: Enter your phone number</h2>
+<form method="post">
+  <input name="phone" placeholder="+1234567890" required>
+  <button type="submit">Send Code</button>
+</form>
+"""
+
+CODE_FORM = """<!doctype html>
+<title>Enter the Code</title>
+<h2>Step 2: Enter the code you received</h2>
+<form method="post">
+  <input name="code" placeholder="12345" required>
+  <button type="submit">Verify</button>
+</form>
+"""
+
 # Global Değişkenler
 user_client = TelegramClient('user_session', API_ID, API_HASH)
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 app = Flask(__name__)
+app.secret_key = os.urandom(24).hex()
 pg_pool = None
 bot_running = True
 
 # ----------------------------------------------------------------------
-# 2. VERİTABANI YÖNETİMİ
+# 2. VERİTABANI YÖNETİMİ (Kodun geri kalanı aynı)
 # ----------------------------------------------------------------------
+# ... (DB fonksiyonları, init_db_pool ve init_db bu blokta kalır)
 
 def init_db_pool():
     global pg_pool
@@ -184,25 +205,20 @@ def extract_bet_data(message_text):
 
 def build_telegram_message(data):
     """Ultra Minimalist İngilizce Şablonu (Yeni Sinyal)"""
-    # Telegram şablonu (Sade ve Butonsuz)
     return f"""
 {data['maç_skor']}
 {data['lig']}
 {data['dakika']}. min
 {data['tahmin']}
-""" # <-- FIX
+"""
 
 def build_x_tweet(data):
     """X (Twitter) için minimalist şablon (Yeni Sinyal)"""
-    # X şablonu (Tek satır ve hashtag'ler dahil)
+    # NOTE: Bu template, yeni unstructured sinyal örneğine uygun değildir
     return f"""
 {data['maç_skor']} | {data['dakika']}. min
 {data['tahmin']}
-
-#LiveBet #BettingTips #FootballTips
-""" # <-- FIX
-
-
+"""
 
 def build_telegram_edit(result_icon):
     """Telegram mesaj düzenlemesi için sonuç metni (İngilizce)"""
@@ -344,7 +360,7 @@ async def handle_incoming_message(event):
                 entity=TARGET_CHANNEL,
                 message=telegram_message,
                 parse_mode='Markdown',
-                buttons=BETTING_BUTTONS 
+                buttons=BETTING_BUTTONS
             )
             target_message_id = sent_message.id
         except Exception as e:
@@ -355,7 +371,7 @@ async def handle_incoming_message(event):
             await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
 
 # ----------------------------------------------------------------------
-# 6. ASENKRON ZAMANLAMA GÖREVİ (4 SAAT)
+# 8. ASENKRON ZAMANLAMA GÖREVİ (4 SAAT)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -386,28 +402,53 @@ async def scheduled_post_task():
         await asyncio.sleep(interval)
 
 # ----------------------------------------------------------------------
-# 7. YÖNETİM VE FLASK (RENDER)
+# 9. FLASK ROTALARI (SİNKRON HALE GETİRİLDİ)
 # ----------------------------------------------------------------------
 
-@bot_client.on(events.NewMessage(pattern='/start', chats=DEFAULT_ADMIN_ID))
-async def start_handler(event):
-    """Admin'in botu başlatma komutu."""
-    global bot_running
-    if not bot_running:
-        bot_running = True
-        await event.respond('✅ Betting Signal Bot is RUNNING and listening for signals.')
-    else:
-        await event.respond('Bot is already running.')
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        form = request.form
+        phone = form.get('phone', '').strip()
+        if not phone:
+            return "<p>Phone number is required.</p>", 400
+        session['phone'] = phone
+        try:
+            # Client bağlantı ve kod gönderme işlemini ayrı thread'de çalıştır
+            asyncio.run(user_client.connect()) 
+            asyncio.run(user_client.send_code_request(phone))
+            
+            logging.info(f"Sent login code request to {phone}")
+            return redirect('/submit-code')
+        except Exception as e:
+            logging.error(f"Error sending login code to {phone}: {e}")
+            return f"<p>Error sending code: {e}</p>", 500
+    return render_template_string(LOGIN_FORM)
 
-@bot_client.on(events.NewMessage(pattern='/stop', chats=DEFAULT_ADMIN_ID))
-async def stop_handler(event):
-    """Admin'in botu durdurma komutu."""
-    global bot_running
-    if bot_running:
-        bot_running = False
-        await event.respond('🛑 Betting Signal Bot is STOPPED. New signals will not be processed.')
-    else:
-        await event.respond('Bot is already stopped.')
+@app.route('/submit-code', methods=['GET', 'POST'])
+def submit_code():
+    if 'phone' not in session:
+        return redirect('/login')
+
+    phone = session['phone']
+
+    if request.method == 'POST':
+        form = request.form
+        code = form.get('code', '').strip()
+        if not code:
+            return "<p>Code is required.</p>", 400
+        try:
+            # Oturum açma işlemini ayrı thread'de çalıştır
+            asyncio.run(user_client.sign_in(phone, code)) 
+            
+            logging.info(f"Logged in user-client for {phone}")
+            session.pop('phone', None)
+            return "<p>Login successful! You can close this tab or restart the service.</p>"
+        except Exception as e:
+            logging.error(f"Login failed for {phone}: {e}")
+            return f"<p>Login failed: {e}</p>", 400
+
+    return render_template_string(CODE_FORM)
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -419,14 +460,13 @@ def health_check():
     }), 200
 
 # ----------------------------------------------------------------------
-# 8. ANA BAŞLATMA MANTIĞI
+# 10. ANA BAŞLATMA MANTIĞI
 # ----------------------------------------------------------------------
 
 def run_telethon_clients():
-    """Telethon client'larını başlatır."""
+    """Telethon client'larını başlatır (Kritik Event Loop Çözümü)."""
     logging.info("Telethon clients starting...")
     
-    # DB Pool'u ve tabloları başlat
     try:
         init_db_pool()
         init_db()
@@ -454,16 +494,13 @@ def run_telethon_clients():
         except Exception as e:
             logging.error(f"Client startup failed or runtime error: {e}")
     
-    # Loop'u çalıştır
     loop.run_until_complete(start_clients_and_tasks())
 
 
 if __name__ == '__main__':
-    # Telethon client'larını ayrı bir thread'de çalıştır
     telethon_thread = threading.Thread(target=run_telethon_clients)
     telethon_thread.daemon = True
     telethon_thread.start()
     
-    # Flask uygulamasını ana thread'de çalıştır (Render)
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
