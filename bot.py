@@ -76,15 +76,17 @@ CODE_FORM = """<!doctype html>
 </form>
 """
 
+# Global Değişkenler
 user_client = TelegramClient('user_session', API_ID, API_HASH)
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 pg_pool = None
+telethon_loop = None # KRİTİK: Global Event Loop referansı
 bot_running = True
 
 # ----------------------------------------------------------------------
-# 2. VERİTABANI YÖNETİMİ (Kodun geri kalanı aynı)
+# 2. VERİTABANI YÖNETİMİ
 # ----------------------------------------------------------------------
 def init_db_pool():
     global pg_pool
@@ -157,8 +159,9 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
         pg_pool.putconn(conn)
 
 # ----------------------------------------------------------------------
-# 3. VERİ ÇIKARMA VE ŞABLONLAMA (Kodun geri kalanı aynı)
+# 3. VERİ ÇIKARMA VE ŞABLONLAMA
 # ----------------------------------------------------------------------
+# ... (extract_bet_data, build_telegram_message, build_x_tweet, build_telegram_edit, build_x_reply_tweet fonksiyonları burada devam eder)
 
 def extract_bet_data(message_text):
     """Bahis sinyalinden ve sonuçtan gerekli verileri Regex ile çıkarır."""
@@ -404,14 +407,13 @@ def login():
             return "<p>Phone number is required.</p>", 400
         session['phone'] = phone
         try:
-            loop = user_client.loop
+            global telethon_loop
+            # Global loop'u kullanarak bağlantı işlemlerini güvenli bir şekilde arka plana gönder
             
-            # 1. Bağlantı işlemini aynı loop'a gönder
-            future_connect = asyncio.run_coroutine_threadsafe(user_client.connect(), loop)
+            future_connect = asyncio.run_coroutine_threadsafe(user_client.connect(), telethon_loop)
             future_connect.result()
             
-            # 2. Kod gönderme işlemini aynı loop'a gönder
-            future_send = asyncio.run_coroutine_threadsafe(user_client.send_code_request(phone), loop)
+            future_send = asyncio.run_coroutine_threadsafe(user_client.send_code_request(phone), telethon_loop)
             future_send.result()
             
             logging.info(f"Sent login code request to {phone}")
@@ -434,10 +436,10 @@ def submit_code():
         if not code:
             return "<p>Code is required.</p>", 400
         try:
-            loop = user_client.loop
+            global telethon_loop
             
             # Oturum açma işlemini aynı loop'a gönder
-            future_signin = asyncio.run_coroutine_threadsafe(user_client.sign_in(phone, code), loop)
+            future_signin = asyncio.run_coroutine_threadsafe(user_client.sign_in(phone, code), telethon_loop)
             future_signin.result()
             
             logging.info(f"Logged in user-client for {phone}")
@@ -464,6 +466,7 @@ def health_check():
 
 def run_telethon_clients():
     """Telethon client'larını başlatır (Kritik Event Loop Çözümü)."""
+    global telethon_loop
     logging.info("Telethon clients starting...")
     
     try:
@@ -474,26 +477,23 @@ def run_telethon_clients():
         return
 
     # Ayrı Thread'de Loop Oluşturma ve Ayarlama
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    telethon_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(telethon_loop)
     
     async def start_clients_and_tasks():
         try:
-            # Client'ları asenkron olarak başlat
             await user_client.start()
             await bot_client.start(bot_token=BOT_TOKEN)
             logging.info("User Client and Bot Client started.")
             
-            # Asenkron zamanlama görevini başlat
-            loop.create_task(scheduled_post_task())
+            telethon_loop.create_task(scheduled_post_task())
             
-            # Ana döngüyü çalıştır (Bağlantı kesilene kadar bekle)
             await user_client.run_until_disconnected()
 
         except Exception as e:
             logging.error(f"Client startup failed or runtime error: {e}")
     
-    loop.run_until_complete(start_clients_and_tasks())
+    telethon_loop.run_until_complete(start_clients_and_tasks())
 
 
 if __name__ == '__main__':
