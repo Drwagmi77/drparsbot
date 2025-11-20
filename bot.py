@@ -16,7 +16,6 @@ import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Ortam değişkenlerinden çekilir (DB, API, X anahtarları)
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -36,10 +35,8 @@ X_CONSUMER_SECRET = os.getenv('X_CONSUMER_SECRET')
 X_ACCESS_TOKEN = os.getenv('X_ACCESS_TOKEN')
 X_ACCESS_TOKEN_SECRET = os.getenv('X_ACCESS_TOKEN_SECRET')
 
-# İZİN VERİLEN KODLAR (FILTRE)
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
 
-# 4 SAATLİK OTOMATİK GÖNDERİ METNİ (İNGİLİZCE)
 SCHEDULED_MESSAGE = """
 ✅ OUR SPONSOR SITES; 
 
@@ -54,7 +51,6 @@ https://bit.ly/drparsbet
 bit.ly/3fAja06
 """
 
-# GLOBAL BUTONLAR (HER SİNYALİN ALTINA)
 BETTING_BUTTONS = [
     [
         Button.url("JOIN MELBET (drpars)", "https://bit.ly/drparsbet"),
@@ -62,7 +58,6 @@ BETTING_BUTTONS = [
     ]
 ]
 
-# Flask Login HTML Formları
 LOGIN_FORM = """<!doctype html>
 <title>Telegram Login</title>
 <h2>Step 1: Enter your phone number</h2>
@@ -81,7 +76,6 @@ CODE_FORM = """<!doctype html>
 </form>
 """
 
-# Global Değişkenler
 user_client = TelegramClient('user_session', API_ID, API_HASH)
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 app = Flask(__name__)
@@ -90,9 +84,8 @@ pg_pool = None
 bot_running = True
 
 # ----------------------------------------------------------------------
-# 2. VERİTABANI YÖNETİMİ
+# 2. VERİTABANI YÖNETİMİ (Kodun geri kalanı aynı)
 # ----------------------------------------------------------------------
-
 def init_db_pool():
     global pg_pool
     try:
@@ -164,7 +157,7 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
         pg_pool.putconn(conn)
 
 # ----------------------------------------------------------------------
-# 3. VERİ ÇIKARMA VE ŞABLONLAMA
+# 3. VERİ ÇIKARMA VE ŞABLONLAMA (Kodun geri kalanı aynı)
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
@@ -401,6 +394,7 @@ async def scheduled_post_task():
 # ----------------------------------------------------------------------
 # 7. YÖNETİM VE FLASK (RENDER)
 # ----------------------------------------------------------------------
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -479,18 +473,21 @@ def run_telethon_clients():
         logging.error(f"CRITICAL: DB initialization failed. {e}")
         return
 
-    # >>> KRİTİK HATA ÇÖZÜMÜ: Ayrı Thread'de Loop Oluşturma <<<
+    # Ayrı Thread'de Loop Oluşturma ve Ayarlama
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     async def start_clients_and_tasks():
         try:
+            # Client'ları asenkron olarak başlat
             await user_client.start()
             await bot_client.start(bot_token=BOT_TOKEN)
             logging.info("User Client and Bot Client started.")
             
+            # Asenkron zamanlama görevini başlat
             loop.create_task(scheduled_post_task())
             
+            # Ana döngüyü çalıştır (Bağlantı kesilene kadar bekle)
             await user_client.run_until_disconnected()
 
         except Exception as e:
@@ -504,5 +501,6 @@ if __name__ == '__main__':
     telethon_thread.daemon = True
     telethon_thread.start()
     
+    # Flask'ı Telethon thread'i başlatıldıktan hemen sonra çalıştır
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
