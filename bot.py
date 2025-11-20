@@ -197,8 +197,7 @@ def build_x_tweet(data):
 {data['maç_skor']} | {data['dakika']}. min
 {data['tahmin']}
 
-#LiveBet #BettingTips #FootballTips
-"""
+
 
 def build_telegram_edit(result_icon):
     """Telegram mesaj düzenlemesi için sonuç metni (İngilizce)"""
