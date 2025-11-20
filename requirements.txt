@@ -1,1 +1,4 @@
-requests
+Flask
+telethon
+psycopg2-binary
+tweepy
