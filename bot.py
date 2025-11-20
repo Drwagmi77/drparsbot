@@ -76,13 +76,13 @@ CODE_FORM = """<!doctype html>
 </form>
 """
 
-# Global Değişkenler
 user_client = TelegramClient('user_session', API_ID, API_HASH)
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 pg_pool = None
-telethon_loop = None # KRİTİK: Global Event Loop referansı
+telethon_loop = None
+telethon_ready = False # KRİTİK: Hazırlık durumu
 bot_running = True
 
 # ----------------------------------------------------------------------
@@ -161,7 +161,6 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
 # ----------------------------------------------------------------------
 # 3. VERİ ÇIKARMA VE ŞABLONLAMA
 # ----------------------------------------------------------------------
-# ... (extract_bet_data, build_telegram_message, build_x_tweet, build_telegram_edit, build_x_reply_tweet fonksiyonları burada devam eder)
 
 def extract_bet_data(message_text):
     """Bahis sinyalinden ve sonuçtan gerekli verileri Regex ile çıkarır."""
@@ -245,7 +244,7 @@ def build_x_reply_tweet(data):
 """
 
 # ----------------------------------------------------------------------
-# 4. X (TWITTER) İŞLEMLERİ (Kodun geri kalanı aynı)
+# 4. X (TWITTER) İŞLEMLERİ
 # ----------------------------------------------------------------------
 def post_to_x_sync(tweet_text, reply_to_id=None):
     """Verilen metni X'e post eder ve Tweet ID'sini döndürür."""
@@ -273,7 +272,7 @@ def post_to_x_sync(tweet_text, reply_to_id=None):
         return None
 
 # ----------------------------------------------------------------------
-# 5. TELEGRAM İŞLEYİCİLERİ (HANDLER) (Kodun geri kalanı aynı)
+# 5. TELEGRAM İŞLEYİCİLERİ (HANDLER)
 # ----------------------------------------------------------------------
 
 @user_client.on(events.NewMessage(chats=int(SOURCE_CHANNEL) if SOURCE_CHANNEL and SOURCE_CHANNEL.startswith('-100') else SOURCE_CHANNEL))
@@ -364,7 +363,7 @@ async def handle_incoming_message(event):
             await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
 
 # ----------------------------------------------------------------------
-# 6. ASENKRON ZAMANLAMA GÖREVİ (4 SAAT) (Kodun geri kalanı aynı)
+# 6. ASENKRON ZAMANLAMA GÖREVİ (4 SAAT)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -395,7 +394,7 @@ async def scheduled_post_task():
         await asyncio.sleep(interval)
 
 # ----------------------------------------------------------------------
-# 7. YÖNETİM VE FLASK (RENDER)
+# 7. YÖNETİM VE FLASK ROTALARI (GÜNCELLENMİŞ)
 # ----------------------------------------------------------------------
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -408,11 +407,14 @@ def login():
         session['phone'] = phone
         try:
             global telethon_loop
-            # Global loop'u kullanarak bağlantı işlemlerini güvenli bir şekilde arka plana gönder
+            if not telethon_loop:
+                return "<p>Telegram client not ready. Please wait.</p>", 503
             
+            # 1. Bağlantı işlemini aynı loop'a gönder
             future_connect = asyncio.run_coroutine_threadsafe(user_client.connect(), telethon_loop)
             future_connect.result()
             
+            # 2. Kod gönderme işlemini aynı loop'a gönder
             future_send = asyncio.run_coroutine_threadsafe(user_client.send_code_request(phone), telethon_loop)
             future_send.result()
             
@@ -437,7 +439,9 @@ def submit_code():
             return "<p>Code is required.</p>", 400
         try:
             global telethon_loop
-            
+            if not telethon_loop:
+                return "<p>Telegram client not ready. Please wait.</p>", 503
+
             # Oturum açma işlemini aynı loop'a gönder
             future_signin = asyncio.run_coroutine_threadsafe(user_client.sign_in(phone, code), telethon_loop)
             future_signin.result()
@@ -466,7 +470,7 @@ def health_check():
 
 def run_telethon_clients():
     """Telethon client'larını başlatır (Kritik Event Loop Çözümü)."""
-    global telethon_loop
+    global telethon_loop, telethon_ready
     logging.info("Telethon clients starting...")
     
     try:
@@ -481,17 +485,20 @@ def run_telethon_clients():
     asyncio.set_event_loop(telethon_loop)
     
     async def start_clients_and_tasks():
+        global telethon_ready
         try:
             await user_client.start()
             await bot_client.start(bot_token=BOT_TOKEN)
-            logging.info("User Client and Bot Client started.")
+            logging.info("✅ User Client and Bot Client started successfully.")
             
+            telethon_ready = True # Başarılı bağlantı sonrası True yapıldı
             telethon_loop.create_task(scheduled_post_task())
             
             await user_client.run_until_disconnected()
 
         except Exception as e:
-            logging.error(f"Client startup failed or runtime error: {e}")
+            logging.error(f"❌ Client startup failed: {e}")
+            telethon_ready = False # Başarısız olursa False
     
     telethon_loop.run_until_complete(start_clients_and_tasks())
 
