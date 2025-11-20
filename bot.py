@@ -9,6 +9,7 @@ import psycopg2
 from psycopg2 import pool
 from flask import Flask, jsonify, request, session, redirect, render_template_string
 import time
+import queue
 
 # ----------------------------------------------------------------------
 # 1. ORTAM DEĞİŞKENLERİ VE YAPILANDIRMA
@@ -58,36 +59,219 @@ BETTING_BUTTONS = [
     ]
 ]
 
-LOGIN_FORM = """<!doctype html>
-<title>Telegram Login</title>
-<h2>Step 1: Enter your phone number</h2>
-<form method="post">
-  <input name="phone" placeholder="+1234567890" required>
-  <button type="submit">Send Code</button>
-</form>
-"""
-
-CODE_FORM = """<!doctype html>
-<title>Enter the Code</title>
-<h2>Step 2: Enter the code you received</h2>
-<form method="post">
-  <input name="code" placeholder="12345" required>
-  <button type="submit">Verify</button>
-</form>
-"""
-
-user_client = TelegramClient('user_session', API_ID, API_HASH)
-bot_client = TelegramClient('bot_session', API_ID, API_HASH)
+# Global variables
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 pg_pool = None
-telethon_loop = None
-telethon_ready = False # KRİTİK: Hazırlık durumu
+telegram_manager = None
 bot_running = True
 
 # ----------------------------------------------------------------------
-# 2. VERİTABANI YÖNETİMİ
+# 2. TELEGRAM MANAGER - Ayrı thread'de çalışacak
 # ----------------------------------------------------------------------
+
+class TelegramManager:
+    def __init__(self):
+        self.user_client = None
+        self.bot_client = None
+        self.loop = None
+        self.ready = False
+        self.task_queue = queue.Queue()
+        self.result_queue = queue.Queue()
+    
+    def start(self):
+        """Telegram client'larını ayrı thread'de başlat"""
+        def run_telegram():
+            try:
+                # Yeni event loop oluştur
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                
+                # Client'ları oluştur
+                self.user_client = TelegramClient('user_session', API_ID, API_HASH, loop=self.loop)
+                self.bot_client = TelegramClient('bot_session', API_ID, API_HASH, loop=self.loop)
+                
+                # Başlat
+                self.loop.run_until_complete(self._start_clients())
+                
+                # Sürekli çalış
+                self.loop.run_forever()
+                
+            except Exception as e:
+                logging.error(f"❌ Telegram manager failed: {e}")
+                self.ready = False
+        
+        telegram_thread = threading.Thread(target=run_telegram, daemon=True)
+        telegram_thread.start()
+        logging.info("✅ Telegram manager thread started")
+        return telegram_thread
+    
+    async def _start_clients(self):
+        """Client'ları başlat ve handler'ları kur"""
+        try:
+            # Bot client'ı başlat
+            await self.bot_client.start(bot_token=BOT_TOKEN)
+            logging.info("✅ Bot client started successfully")
+            
+            # User client'ı bağla (login değil)
+            await self.user_client.connect()
+            logging.info("✅ User client connected (ready for login)")
+            
+            # Handler'ları kur
+            await self._setup_handlers()
+            
+            # Zamanlama görevini başlat
+            asyncio.create_task(self._scheduled_post_task())
+            
+            self.ready = True
+            logging.info("✅ Telegram manager is ready")
+            
+        except Exception as e:
+            logging.error(f"❌ Client startup failed: {e}")
+            self.ready = False
+    
+    async def _setup_handlers(self):
+        """Message handler'ları kur"""
+        @self.user_client.on(events.NewMessage(chats=int(SOURCE_CHANNEL) if SOURCE_CHANNEL and SOURCE_CHANNEL.startswith('-100') else SOURCE_CHANNEL))
+        async def handle_incoming_message(event):
+            await self._process_signal_message(event)
+    
+    async def _process_signal_message(self, event):
+        """Sinyal mesajlarını işle"""
+        global bot_running
+        
+        if not bot_running:
+            return
+            
+        message_text = event.message.message
+        data = await asyncio.to_thread(extract_bet_data, message_text)
+        
+        if not data or not data['signal_key']:
+            return
+
+        is_result = data['result_icon'] is not None
+        signal_key = data['signal_key']
+
+        if is_result:
+            # SONUÇ MESAJI İŞLEME
+            target_message_id, tweet_id = await asyncio.to_thread(get_signal_data, signal_key)
+
+            if target_message_id and tweet_id:
+                logging.info(f"Sonuç tespit edildi. Mesaj ID: {target_message_id}, Tweet ID: {tweet_id} düzenleniyor.")
+                
+                # 1. TELEGRAM MESAJINI DÜZENLE
+                try:
+                    original_msg = await self.bot_client.get_messages(TARGET_CHANNEL, ids=target_message_id)
+                    new_text = original_msg.message + build_telegram_edit(data['result_icon'])
+                    
+                    await self.bot_client.edit_message(
+                        entity=TARGET_CHANNEL,
+                        message=target_message_id,
+                        text=new_text,
+                        buttons=BETTING_BUTTONS
+                    )
+                    logging.info(f"Telegram mesajı başarıyla düzenlendi: {target_message_id}")
+                except Exception as e:
+                    logging.error(f"Telegram mesaj düzenleme hatası: {e}")
+                    
+                # 2. X'E YANIT TWEET'İ GÖNDER
+                x_reply_tweet_text = build_x_reply_tweet(data)
+                if x_reply_tweet_text:
+                    await asyncio.to_thread(post_to_x_sync, x_reply_tweet_text, reply_to_id=tweet_id)
+
+            else:
+                logging.warning(f"Sonuç geldi ancak orijinal sinyal veritabanında bulunamadı: {signal_key}")
+
+        else:
+            # YENİ SİNYAL İŞLEME
+            if data.get('alert_code') not in ALLOWED_ALERT_CODES:
+                logging.info(f"AlertCode: {data.get('alert_code')} izin verilenler listesinde değil. Atlanıyor.")
+                return
+
+            # Tekrar kontrolü
+            if await asyncio.to_thread(get_signal_data, signal_key):
+                logging.info(f"Sinyal {signal_key} daha önce işlenmiş. Atlanıyor.")
+                return
+
+            logging.info(f"Yeni AlertCode {data['alert_code']} sinyali tespit edildi: {signal_key}. İşleniyor...")
+
+            # Şablonları oluştur
+            telegram_message = build_telegram_message(data)
+            x_tweet = build_x_tweet(data)
+            tweet_id = None
+            target_message_id = None
+
+            # X'e post et
+            tweet_id = await asyncio.to_thread(post_to_x_sync, x_tweet)
+            
+            # Telegram'a post et
+            try:
+                sent_message = await self.bot_client.send_message(
+                    entity=TARGET_CHANNEL,
+                    message=telegram_message,
+                    parse_mode='Markdown',
+                    buttons=BETTING_BUTTONS
+                )
+                target_message_id = sent_message.id
+            except Exception as e:
+                logging.error(f"Telegram post hatası: {e}")
+                
+            # Veritabanına kaydet
+            if target_message_id:
+                await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
+
+    async def _scheduled_post_task(self):
+        """Her 4 saatte bir otomatik mesaj gönderir."""
+        interval = 4 * 60 * 60
+        
+        now = time.time()
+        next_run_time = (now // interval + 1) * interval
+        initial_wait = next_run_time - now
+        
+        logging.info(f"Otomatik gönderim döngüsü başlatılıyor. İlk gönderim için bekleme: {initial_wait:.2f} saniye.")
+        
+        await asyncio.sleep(initial_wait)
+        
+        while True:
+            if bot_running and self.bot_client.is_connected():
+                try:
+                    await self.bot_client.send_message(
+                        entity=TARGET_CHANNEL,
+                        message=SCHEDULED_MESSAGE,
+                        parse_mode='Markdown'
+                    )
+                    logging.info("Otomatik 4 saatlik gönderi başarıyla atıldı.")
+                except Exception as e:
+                    logging.error(f"Otomatik gönderi hatası: {e}")
+            
+            await asyncio.sleep(interval)
+
+    def send_code_request(self, phone):
+        """Telegram'a kod gönder"""
+        if not self.loop or not self.ready:
+            raise Exception("Telegram client not ready")
+        
+        async def _send_code():
+            return await self.user_client.send_code_request(phone)
+        
+        future = asyncio.run_coroutine_threadsafe(_send_code(), self.loop)
+        return future.result(timeout=30)
+    
+    def sign_in(self, phone, code):
+        """Kod ile giriş yap"""
+        if not self.loop or not self.ready:
+            raise Exception("Telegram client not ready")
+        
+        async def _sign_in():
+            return await self.user_client.sign_in(phone, code)
+        
+        future = asyncio.run_coroutine_threadsafe(_sign_in(), self.loop)
+        return future.result(timeout=30)
+
+# ----------------------------------------------------------------------
+# 3. VERİTABANI YÖNETİMİ
+# ----------------------------------------------------------------------
+
 def init_db_pool():
     global pg_pool
     try:
@@ -159,7 +343,7 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
         pg_pool.putconn(conn)
 
 # ----------------------------------------------------------------------
-# 3. VERİ ÇIKARMA VE ŞABLONLAMA
+# 4. VERİ ÇIKARMA VE ŞABLONLAMA
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
@@ -244,8 +428,9 @@ def build_x_reply_tweet(data):
 """
 
 # ----------------------------------------------------------------------
-# 4. X (TWITTER) İŞLEMLERİ
+# 5. X (TWITTER) İŞLEMLERİ
 # ----------------------------------------------------------------------
+
 def post_to_x_sync(tweet_text, reply_to_id=None):
     """Verilen metni X'e post eder ve Tweet ID'sini döndürür."""
     try:
@@ -272,242 +457,177 @@ def post_to_x_sync(tweet_text, reply_to_id=None):
         return None
 
 # ----------------------------------------------------------------------
-# 5. TELEGRAM İŞLEYİCİLERİ (HANDLER)
-# ----------------------------------------------------------------------
-
-@user_client.on(events.NewMessage(chats=int(SOURCE_CHANNEL) if SOURCE_CHANNEL and SOURCE_CHANNEL.startswith('-100') else SOURCE_CHANNEL))
-async def handle_incoming_message(event):
-    """Kaynak kanaldan gelen tüm mesajları işler (Yeni sinyal veya Sonuç)."""
-    global bot_running
-
-    if not bot_running:
-        return
-        
-    message_text = event.message.message
-    data = extract_bet_data(message_text)
-    
-    if not data or not data['signal_key']:
-        return
-
-    is_result = data['result_icon'] is not None
-    signal_key = data['signal_key']
-
-    if is_result:
-        # --- A. SONUÇ MESAJI İŞLEME ---
-        target_message_id, tweet_id = await asyncio.to_thread(get_signal_data, signal_key)
-
-        if target_message_id and tweet_id:
-            logging.info(f"Sonuç tespit edildi. Mesaj ID: {target_message_id}, Tweet ID: {tweet_id} düzenleniyor.")
-            
-            # 1. TELEGRAM MESAJINI DÜZENLE
-            try:
-                original_msg = await bot_client.get_messages(TARGET_CHANNEL, ids=target_message_id)
-                new_text = original_msg.message + build_telegram_edit(data['result_icon'])
-                
-                await bot_client.edit_message(
-                    entity=TARGET_CHANNEL,
-                    message=target_message_id,
-                    text=new_text,
-                    buttons=BETTING_BUTTONS
-                )
-                logging.info(f"Telegram mesajı başarıyla düzenlendi: {target_message_id}")
-            except Exception as e:
-                logging.error(f"Telegram mesaj düzenleme hatası: {e}")
-                
-            # 2. X'E YANIT TWEET'İ GÖNDER
-            x_reply_tweet_text = build_x_reply_tweet(data)
-            if x_reply_tweet_text:
-                 await asyncio.to_thread(post_to_x_sync, x_reply_tweet_text, reply_to_id=tweet_id)
-
-        else:
-            logging.warning(f"Sonuç geldi ancak orijinal sinyal veritabanında bulunamadı veya ID'ler eksik: {signal_key}")
-
-    else:
-        # --- B. YENİ SİNYAL İŞLEME ---
-        
-        # 1. Filtreleme Kontrolü (Alert Code)
-        if data.get('alert_code') not in ALLOWED_ALERT_CODES:
-            logging.info(f"AlertCode: {data.get('alert_code')} izin verilenler listesinde değil. Atlanıyor.")
-            return
-
-        # 2. Tekrar Kontrolü (Veritabanı)
-        if await asyncio.to_thread(get_signal_data, signal_key):
-            logging.info(f"Sinyal {signal_key} daha önce işlenmiş. Atlanıyor.")
-            return
-
-        logging.info(f"Yeni AlertCode {data['alert_code']} sinyali tespit edildi: {signal_key}. İşleniyor...")
-
-        # 3. Şablonları Oluştur
-        telegram_message = build_telegram_message(data)
-        x_tweet = build_x_tweet(data)
-        tweet_id = None
-        target_message_id = None
-
-        # 4. X'e (Twitter) Post Et
-        tweet_id = await asyncio.to_thread(post_to_x_sync, x_tweet)
-        
-        # 5. Telegram'a Post Et
-        try:
-            sent_message = await bot_client.send_message(
-                entity=TARGET_CHANNEL,
-                message=telegram_message,
-                parse_mode='Markdown',
-                buttons=BETTING_BUTTONS
-            )
-            target_message_id = sent_message.id
-        except Exception as e:
-            logging.error(f"Telegram post hatası: {e}")
-            
-        # 6. Başarılıysa Veritabanına Kaydet
-        if target_message_id:
-            await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
-
-# ----------------------------------------------------------------------
-# 6. ASENKRON ZAMANLAMA GÖREVİ (4 SAAT)
-# ----------------------------------------------------------------------
-
-async def scheduled_post_task():
-    """Her 4 saatte bir otomatik mesaj gönderir."""
-    
-    interval = 4 * 60 * 60
-    
-    now = time.time()
-    next_run_time = (now // interval + 1) * interval
-    initial_wait = next_run_time - now
-    
-    logging.info(f"Otomatik gönderim döngüsü başlatılıyor. İlk gönderim için bekleme süresi: {initial_wait:.2f} saniye.")
-    
-    await asyncio.sleep(initial_wait)
-    
-    while True:
-        if bot_running and bot_client.is_connected():
-            try:
-                await bot_client.send_message(
-                    entity=TARGET_CHANNEL,
-                    message=SCHEDULED_MESSAGE,
-                    parse_mode='Markdown'
-                )
-                logging.info("Otomatik 4 saatlik gönderi başarıyla atıldı.")
-            except Exception as e:
-                logging.error(f"Otomatik gönderi hatası: {e}")
-        
-        await asyncio.sleep(interval)
-
-# ----------------------------------------------------------------------
-# 7. YÖNETİM VE FLASK ROTALARI (GÜNCELLENMİŞ)
+# 6. FLASK ROTALARI - Basit ve hızlı
 # ----------------------------------------------------------------------
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    """Basit login sayfası"""
+    
     if request.method == 'POST':
-        form = request.form
-        phone = form.get('phone', '').strip()
+        phone = request.form.get('phone', '').strip()
         if not phone:
-            return "<p>Phone number is required.</p>", 400
+            return "<p>❌ Phone number is required.</p>", 400
+        
+        if not phone.startswith('+'):
+            return "<p>❌ Please use international format: +1234567890</p>", 400
+        
         session['phone'] = phone
+        
         try:
-            global telethon_loop
-            if not telethon_loop:
-                return "<p>Telegram client not ready. Please wait.</p>", 503
-            
-            # 1. Bağlantı işlemini aynı loop'a gönder
-            future_connect = asyncio.run_coroutine_threadsafe(user_client.connect(), telethon_loop)
-            future_connect.result()
-            
-            # 2. Kod gönderme işlemini aynı loop'a gönder
-            future_send = asyncio.run_coroutine_threadsafe(user_client.send_code_request(phone), telethon_loop)
-            future_send.result()
-            
-            logging.info(f"Sent login code request to {phone}")
+            telegram_manager.send_code_request(phone)
+            logging.info(f"✅ Code sent to {phone}")
             return redirect('/submit-code')
+            
         except Exception as e:
-            logging.error(f"Error sending login code to {phone}: {e}")
-            return f"<p>Error sending code: {e}</p>", 500
-    return render_template_string(LOGIN_FORM)
+            logging.error(f"❌ Code send failed for {phone}: {e}")
+            return f"""
+            <h2>❌ Failed to Send Code</h2>
+            <p><strong>Error:</strong> {str(e)}</p>
+            <p><a href="/login">Try Again</a></p>
+            """, 500
+    
+    return """
+    <!doctype html>
+    <html>
+    <head>
+        <title>Telegram Login</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }
+            .form-group { margin: 20px 0; }
+            input[type="text"] { width: 100%; padding: 12px; font-size: 16px; border: 1px solid #ddd; border-radius: 5px; }
+            button { width: 100%; padding: 12px; font-size: 16px; background: #0088cc; color: white; border: none; border-radius: 5px; cursor: pointer; }
+            button:hover { background: #006699; }
+        </style>
+    </head>
+    <body>
+        <h2>🔐 Telegram Login</h2>
+        <form method="post">
+            <div class="form-group">
+                <input type="text" name="phone" placeholder="+1234567890" required>
+            </div>
+            <button type="submit">📲 Send Verification Code</button>
+        </form>
+    </body>
+    </html>
+    """
 
 @app.route('/submit-code', methods=['GET', 'POST'])
 def submit_code():
+    """Kod doğrulama sayfası"""
+    
     if 'phone' not in session:
         return redirect('/login')
-
+    
     phone = session['phone']
-
+    
     if request.method == 'POST':
-        form = request.form
-        code = form.get('code', '').strip()
+        code = request.form.get('code', '').strip()
         if not code:
-            return "<p>Code is required.</p>", 400
+            return "<p>❌ Verification code is required.</p>", 400
+        
         try:
-            global telethon_loop
-            if not telethon_loop:
-                return "<p>Telegram client not ready. Please wait.</p>", 503
-
-            # Oturum açma işlemini aynı loop'a gönder
-            future_signin = asyncio.run_coroutine_threadsafe(user_client.sign_in(phone, code), telethon_loop)
-            future_signin.result()
-            
-            logging.info(f"Logged in user-client for {phone}")
+            telegram_manager.sign_in(phone, code)
+            logging.info(f"✅ Successfully logged in: {phone}")
             session.pop('phone', None)
-            return "<p>Login successful! You can close this tab or restart the service.</p>"
+            
+            return """
+            <!doctype html>
+            <html>
+            <head>
+                <title>Login Successful</title>
+                <style>
+                    body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; text-align: center; }
+                    .success { color: #28a745; font-size: 48px; }
+                </style>
+            </head>
+            <body>
+                <div class="success">✅</div>
+                <h2>Login Successful!</h2>
+                <p>Your Telegram account has been connected successfully.</p>
+                <p>The bot is now ready to process signals.</p>
+                <br>
+                <a href="/">Go to Dashboard</a>
+            </body>
+            </html>
+            """
+            
         except Exception as e:
-            logging.error(f"Login failed for {phone}: {e}")
-            return f"<p>Login failed: {e}</p>", 400
+            logging.error(f"❌ Login failed for {phone}: {e}")
+            return f"""
+            <h2>❌ Verification Failed</h2>
+            <p><strong>Error:</strong> {str(e)}</p>
+            <p>Please check the code and try again.</p>
+            <p><a href="/submit-code">Try Again</a> | <a href="/login">Use Different Number</a></p>
+            """, 400
+    
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+        <title>Enter Verification Code</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }}
+            .phone-info {{ background: #e8f5e8; padding: 10px; border-radius: 5px; margin: 15px 0; }}
+            .form-group {{ margin: 20px 0; }}
+            input[type="text"] {{ width: 100%; padding: 12px; font-size: 18px; text-align: center; border: 2px solid #ddd; border-radius: 5px; }}
+            button {{ width: 100%; padding: 12px; font-size: 16px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; }}
+        </style>
+    </head>
+    <body>
+        <h2>📋 Enter Verification Code</h2>
+        <div class="phone-info">
+            <strong>Phone:</strong> {phone}
+        </div>
+        <form method="post">
+            <div class="form-group">
+                <input type="text" name="code" placeholder="12345" required>
+            </div>
+            <button type="submit">✅ Verify Code</button>
+        </form>
+    </body>
+    </html>
+    """
 
-    return render_template_string(CODE_FORM)
+@app.route('/status')
+def status():
+    """Sistem durumunu göster"""
+    status_info = {
+        'flask_running': True,
+        'telegram_ready': telegram_manager.ready if telegram_manager else False,
+        'bot_running': bot_running
+    }
+    
+    return jsonify(status_info)
 
 @app.route('/', methods=['GET'])
 def health_check():
-    """Render sağlık kontrolü (Health Check) endpoint'i."""
+    """Ana sayfa"""
     return jsonify({
         "status": "ok",
-        "message": "Bot infrastructure is running (Flask active).",
+        "message": "Bot infrastructure is running",
         "bot_state": "running" if bot_running else "stopped"
     }), 200
 
 # ----------------------------------------------------------------------
-# 8. ANA BAŞLATMA MANTIĞI
+# 7. UYGULAMA BAŞLATMA
 # ----------------------------------------------------------------------
 
-def run_telethon_clients():
-    """Telethon client'larını başlatır (Kritik Event Loop Çözümü)."""
-    global telethon_loop, telethon_ready
-    logging.info("Telethon clients starting...")
-    
+if __name__ == '__main__':
+    # Database başlat
     try:
         init_db_pool()
         init_db()
+        logging.info("✅ Database initialized")
     except Exception as e:
-        logging.error(f"CRITICAL: DB initialization failed. {e}")
-        return
-
-    # Ayrı Thread'de Loop Oluşturma ve Ayarlama
-    telethon_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(telethon_loop)
+        logging.error(f"❌ Database init failed: {e}")
     
-    async def start_clients_and_tasks():
-        global telethon_ready
-        try:
-            await user_client.start()
-            await bot_client.start(bot_token=BOT_TOKEN)
-            logging.info("✅ User Client and Bot Client started successfully.")
-            
-            telethon_ready = True # Başarılı bağlantı sonrası True yapıldı
-            telethon_loop.create_task(scheduled_post_task())
-            
-            await user_client.run_until_disconnected()
-
-        except Exception as e:
-            logging.error(f"❌ Client startup failed: {e}")
-            telethon_ready = False # Başarısız olursa False
+    # Telegram manager'ı başlat
+    telegram_manager = TelegramManager()
+    telegram_thread = telegram_manager.start()
     
-    telethon_loop.run_until_complete(start_clients_and_tasks())
-
-
-if __name__ == '__main__':
-    telethon_thread = threading.Thread(target=run_telethon_clients)
-    telethon_thread.daemon = True
-    telethon_thread.start()
-    
-    # Flask'ı Telethon thread'i başlatıldıktan hemen sonra çalıştır
+    # Flask'ı başlat
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    logging.info(f"🚀 Starting Flask on port {port}")
+    
+    app.run(host='0.0.0.0', port=port, debug=False)
