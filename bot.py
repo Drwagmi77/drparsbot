@@ -45,8 +45,6 @@ try:
     DEFAULT_ADMIN_ID = int(os.getenv("DEFAULT_ADMIN_ID", "0"))
 except Exception as e:
     logger.critical(f"Missing environment variables: {e}")
-    # Hata durumunda devam etmemesi için exit
-    # exit(1) # Render'da logu görmek için exit yapmıyoruz ama logluyoruz
 
 # GLOBAL BUTONLAR, METİNLER VE FİLTRELER
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
@@ -73,7 +71,6 @@ BETTING_BUTTONS = [
 ]
 
 # Client ve Flask tanımları
-# Loop argümanı verilmiyor, asenkron bağlamda kendisi bulur
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 user_client = TelegramClient('user_session', API_ID, API_HASH)
 
@@ -136,7 +133,7 @@ def init_db_sync():
             );
         """)
         
-        # 2. Kanal Tablosu (Eski yapı uyumluluğu için)
+        # 2. Kanal Tablosu
         cur.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id SERIAL PRIMARY KEY,
@@ -150,7 +147,7 @@ def init_db_sync():
         logger.info("✅ DB tabloları hazır.")
     except Exception as e:
         logger.error(f"Error during database initialization: {e}")
-        # raise # Hata olsa bile devam etmeye çalışalım, belki geçicidir
+        raise
     finally:
         if conn:
             conn.close()
@@ -399,7 +396,7 @@ async def login():
         phone = request.form.get('phone', '').strip()
         session['phone'] = phone
         try:
-            # ÖNEMLİ: connect() yeterli, start() değil!
+            # ÖNEMLİ: Sadece connect, start değil!
             if not user_client.is_connected():
                 await user_client.connect()
             
@@ -433,9 +430,8 @@ async def main_bot_runner():
     # Bot Client: Token ile başlar
     await bot_client.start(bot_token=BOT_TOKEN)
     
-    # User Client: Sadece bağlanır, login'i web'den bekler
-    # start() YERİNE connect() KULLANIYORUZ - BU EOF HATASINI ÇÖZER
-    await user_client.connect()
+    # User Client: Sadece bağlanır, login'i web'den bekler (EOF ÇÖZÜMÜ)
+    await user_client.connect() 
     
     if await user_client.is_user_authorized():
         logger.info("User client authorized.")
