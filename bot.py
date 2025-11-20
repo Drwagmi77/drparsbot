@@ -16,7 +16,7 @@ import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# GEREKLİ TÜM BİLGİLER RENDER ORTAM DEĞİŞKENLERİNDEN ÇEKİLİR
+# Ortam değişkenlerinden çekilir (DB, API, X anahtarları)
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -58,7 +58,7 @@ bit.ly/3fAja06
 BETTING_BUTTONS = [
     [
         Button.url("JOIN MELBET (drpars)", "https://bit.ly/drparsbet"),
-        Button.url("JOIN 1XBET (drparsbet)", "http://bit.ly/3fAja06") # Linki URL formatına çevirdim
+        Button.url("JOIN 1XBET (drparsbet)", "http://bit.ly/3fAja06")
     ]
 ]
 
@@ -151,36 +151,28 @@ def extract_bet_data(message_text):
     """Bahis sinyalinden ve sonuçtan gerekli verileri Regex ile çıkarır."""
     data = {}
     
-    # Maç ve Skor
     match_score_match = re.search(r'⚽ (.*?)\s*\(.*?\)', message_text, re.DOTALL)
     data['maç_skor'] = match_score_match.group(0).strip().replace('⚽ ', '') if match_score_match else None
     
-    # Lig
     lig_match = re.search(r'🏟 (.*?)\n', message_text)
     data['lig'] = lig_match.group(1).strip() if lig_match else None
     
-    # Dakika
     dakika_match = re.search(r'⏰ (\d+)\s*', message_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
-    # Tahmin (İngilizce çeviriyi alır, örn: (0.5 OVER))
     tahmin_match = re.search(r'❗ (.*?)\n', message_text)
     tahmin_en_match = re.search(r'\((.*?)\)', tahmin_match.group(1)) if tahmin_match and '(' in tahmin_match.group(1) else tahmin_match
     data['tahmin'] = tahmin_en_match.group(1).strip() if tahmin_en_match else (tahmin_match.group(1).strip() if tahmin_match else None)
     
-    # AlertCode (Filtreleme için)
     alert_code_match = re.search(r'👉 AlertCode: (\d+)', message_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
 
-    # Sonuç İkonu (✅ veya ❌)
     result_match = re.match(r'([✅❌])', message_text.strip())
     data['result_icon'] = result_match.group(1) if result_match else None
 
-    # Final Skor
     final_score_match = re.search(r'#⃣ FT (\d+ - \d+)', message_text)
     data['final_score'] = final_score_match.group(1).strip() if final_score_match else None
 
-    # Benzersiz Sinyal Anahtarı (Maç+Dakika+Tahmin)
     if all([data.get('maç_skor'), data.get('dakika'), data.get('tahmin')]):
         maç_temiz = re.sub(r'[\(\)]', '', data['maç_skor']).strip().replace(' ', '_').replace('-', '')
         tahmin_temiz = re.sub(r'[^\w\s]', '', data['tahmin']).strip().replace(' ', '_')
@@ -304,7 +296,7 @@ async def handle_incoming_message(event):
                     entity=TARGET_CHANNEL,
                     message=target_message_id,
                     text=new_text,
-                    buttons=BETTING_BUTTONS # Butonları tekrar ekle
+                    buttons=BETTING_BUTTONS
                 )
                 logging.info(f"Telegram mesajı başarıyla düzenlendi: {target_message_id}")
             except Exception as e:
@@ -339,10 +331,10 @@ async def handle_incoming_message(event):
         tweet_id = None
         target_message_id = None
 
-        # 4. X'e (Twitter) Post Et (Önce Twitter'a at ki Tweet ID'yi alalım)
+        # 4. X'e (Twitter) Post Et
         tweet_id = await asyncio.to_thread(post_to_x_sync, x_tweet)
         
-        # 5. Telegram'a Post Et (Butonlar eklenir)
+        # 5. Telegram'a Post Et
         try:
             sent_message = await bot_client.send_message(
                 entity=TARGET_CHANNEL,
@@ -367,7 +359,6 @@ async def scheduled_post_task():
     
     interval = 4 * 60 * 60
     
-    # Başlangıç zamanını 4 saatlik döngüye hizala
     now = time.time()
     next_run_time = (now // interval + 1) * interval
     initial_wait = next_run_time - now
@@ -431,6 +422,7 @@ def run_telethon_clients():
     """Telethon client'larını başlatır."""
     logging.info("Telethon clients starting...")
     
+    # DB Pool'u ve tabloları başlat
     try:
         init_db_pool()
         init_db()
@@ -438,25 +430,36 @@ def run_telethon_clients():
         logging.error(f"CRITICAL: DB initialization failed. {e}")
         return
 
-    try:
-        user_client.start()
-        bot_client.start(bot_token=BOT_TOKEN)
-        logging.info("User Client and Bot Client started.")
-        
-        # Asenkron zamanlama görevini başlat
-        user_client.loop.create_task(scheduled_post_task())
-        
-    except Exception as e:
-        logging.error(f"Client startup failed: {e}")
-        return
-        
-    with user_client, bot_client:
-        user_client.run_until_disconnected()
+    # >>> KRİTİK HATA ÇÖZÜMÜ: Ayrı Thread'de Loop Oluşturma <<<
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def start_clients_and_tasks():
+        try:
+            # Client'ları asenkron olarak başlat
+            await user_client.start()
+            await bot_client.start(bot_token=BOT_TOKEN)
+            logging.info("User Client and Bot Client started.")
+            
+            # Asenkron zamanlama görevini başlat
+            loop.create_task(scheduled_post_task())
+            
+            # Ana döngüyü çalıştır (Bağlantı kesilene kadar bekle)
+            await user_client.run_until_disconnected()
+
+        except Exception as e:
+            logging.error(f"Client startup failed or runtime error: {e}")
+    
+    # Loop'u çalıştır
+    loop.run_until_complete(start_clients_and_tasks())
+
 
 if __name__ == '__main__':
+    # Telethon client'larını ayrı bir thread'de çalıştır
     telethon_thread = threading.Thread(target=run_telethon_clients)
     telethon_thread.daemon = True
     telethon_thread.start()
     
+    # Flask uygulamasını ana thread'de çalıştır (Render)
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
