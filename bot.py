@@ -184,18 +184,23 @@ def extract_bet_data(message_text):
 
 def build_telegram_message(data):
     """Ultra Minimalist İngilizce Şablonu (Yeni Sinyal)"""
+    # Telegram şablonu (Sade ve Butonsuz)
     return f"""
 {data['maç_skor']}
 {data['lig']}
 {data['dakika']}. min
 {data['tahmin']}
-"""
+""" # <-- FIX
 
 def build_x_tweet(data):
     """X (Twitter) için minimalist şablon (Yeni Sinyal)"""
+    # X şablonu (Tek satır ve hashtag'ler dahil)
     return f"""
 {data['maç_skor']} | {data['dakika']}. min
 {data['tahmin']}
+
+#LiveBet #BettingTips #FootballTips
+""" # <-- FIX
 
 
 
