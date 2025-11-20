@@ -90,9 +90,8 @@ pg_pool = None
 bot_running = True
 
 # ----------------------------------------------------------------------
-# 2. VERİTABANI YÖNETİMİ (Kodun geri kalanı aynı)
+# 2. VERİTABANI YÖNETİMİ
 # ----------------------------------------------------------------------
-# ... (DB fonksiyonları, init_db_pool ve init_db bu blokta kalır)
 
 def init_db_pool():
     global pg_pool
@@ -214,7 +213,6 @@ def build_telegram_message(data):
 
 def build_x_tweet(data):
     """X (Twitter) için minimalist şablon (Yeni Sinyal)"""
-    # NOTE: Bu template, yeni unstructured sinyal örneğine uygun değildir
     return f"""
 {data['maç_skor']} | {data['dakika']}. min
 {data['tahmin']}
@@ -251,9 +249,8 @@ def build_x_reply_tweet(data):
 """
 
 # ----------------------------------------------------------------------
-# 4. X (TWITTER) İŞLEMLERİ
+# 4. X (TWITTER) İŞLEMLERİ (Kodun geri kalanı aynı)
 # ----------------------------------------------------------------------
-
 def post_to_x_sync(tweet_text, reply_to_id=None):
     """Verilen metni X'e post eder ve Tweet ID'sini döndürür."""
     try:
@@ -280,7 +277,7 @@ def post_to_x_sync(tweet_text, reply_to_id=None):
         return None
 
 # ----------------------------------------------------------------------
-# 5. TELEGRAM İŞLEYİCİLERİ (HANDLER)
+# 5. TELEGRAM İŞLEYİCİLERİ (HANDLER) (Kodun geri kalanı aynı)
 # ----------------------------------------------------------------------
 
 @user_client.on(events.NewMessage(chats=int(SOURCE_CHANNEL) if SOURCE_CHANNEL and SOURCE_CHANNEL.startswith('-100') else SOURCE_CHANNEL))
@@ -371,7 +368,7 @@ async def handle_incoming_message(event):
             await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
 
 # ----------------------------------------------------------------------
-# 8. ASENKRON ZAMANLAMA GÖREVİ (4 SAAT)
+# 6. ASENKRON ZAMANLAMA GÖREVİ (4 SAAT) (Kodun geri kalanı aynı)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -402,9 +399,8 @@ async def scheduled_post_task():
         await asyncio.sleep(interval)
 
 # ----------------------------------------------------------------------
-# 9. FLASK ROTALARI (SİNKRON HALE GETİRİLDİ)
+# 7. YÖNETİM VE FLASK (RENDER)
 # ----------------------------------------------------------------------
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -414,9 +410,15 @@ def login():
             return "<p>Phone number is required.</p>", 400
         session['phone'] = phone
         try:
-            # Client bağlantı ve kod gönderme işlemini ayrı thread'de çalıştır
-            asyncio.run(user_client.connect()) 
-            asyncio.run(user_client.send_code_request(phone))
+            loop = user_client.loop
+            
+            # 1. Bağlantı işlemini aynı loop'a gönder
+            future_connect = asyncio.run_coroutine_threadsafe(user_client.connect(), loop)
+            future_connect.result()
+            
+            # 2. Kod gönderme işlemini aynı loop'a gönder
+            future_send = asyncio.run_coroutine_threadsafe(user_client.send_code_request(phone), loop)
+            future_send.result()
             
             logging.info(f"Sent login code request to {phone}")
             return redirect('/submit-code')
@@ -438,8 +440,11 @@ def submit_code():
         if not code:
             return "<p>Code is required.</p>", 400
         try:
-            # Oturum açma işlemini ayrı thread'de çalıştır
-            asyncio.run(user_client.sign_in(phone, code)) 
+            loop = user_client.loop
+            
+            # Oturum açma işlemini aynı loop'a gönder
+            future_signin = asyncio.run_coroutine_threadsafe(user_client.sign_in(phone, code), loop)
+            future_signin.result()
             
             logging.info(f"Logged in user-client for {phone}")
             session.pop('phone', None)
@@ -460,7 +465,7 @@ def health_check():
     }), 200
 
 # ----------------------------------------------------------------------
-# 10. ANA BAŞLATMA MANTIĞI
+# 8. ANA BAŞLATMA MANTIĞI
 # ----------------------------------------------------------------------
 
 def run_telethon_clients():
@@ -480,15 +485,12 @@ def run_telethon_clients():
     
     async def start_clients_and_tasks():
         try:
-            # Client'ları asenkron olarak başlat
             await user_client.start()
             await bot_client.start(bot_token=BOT_TOKEN)
             logging.info("User Client and Bot Client started.")
             
-            # Asenkron zamanlama görevini başlat
             loop.create_task(scheduled_post_task())
             
-            # Ana döngüyü çalıştır (Bağlantı kesilene kadar bekle)
             await user_client.run_until_disconnected()
 
         except Exception as e:
