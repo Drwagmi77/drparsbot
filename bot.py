@@ -37,7 +37,11 @@ try:
     DB_USER = os.environ.get("DB_USER")
     DB_PASS = os.environ.get("DB_PASS")
     
-    X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAABUc5gEAAAAACD6SWduyI5kxS2wpt5hxvw9VM7A%3DtCSij2lT2lmJMv0hVbmmHLhagLVbezU83TCGIShF0hFQiCGcvi")
+    # X API Keys - Environment'dan alınacak
+    X_CONSUMER_KEY = os.environ.get("X_CONSUMER_KEY")
+    X_CONSUMER_SECRET = os.environ.get("X_CONSUMER_SECRET")
+    X_ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN")
+    X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET")
     
     DEFAULT_ADMIN_ID = int(os.getenv("DEFAULT_ADMIN_ID", "0"))
 except Exception as e:
@@ -67,54 +71,47 @@ BETTING_BUTTONS = [
     ]
 ]
 
-# ALERT CODE TEMPLATES - PROFESSIONAL ENGLISH FORMATS
+# ALERT CODE TEMPLATES - PROFESSIONAL ENGLISH FORMATS (ALERT CODE GÖSTERİLMEYECEK)
 ALERT_TEMPLATES = {
     '1': {
         'title': "🎯 LIVE GOAL SIGNAL 🎯",
         'bet_type': "NEXT GOAL AFTER 65' (+0.5)",
-        'confidence': "84% Success Rate",
         'stake': "4/5",
         'analysis': "High scoring game pattern, late goal expected"
     },
     '17': {
         'title': "🎯 LIVE TOTAL GOALS SIGNAL 🎯", 
         'bet_type': "TOTAL GOALS 2.5 OVER BEFORE 60'",
-        'confidence': "83% Success Rate",
         'stake': "4/5",
         'analysis': "Fast paced game, both teams attacking"
     },
     '21': {
         'title': "🎯 LIVE CORNER SIGNAL 🎯",
         'bet_type': "TOTAL CORNERS - MATCH RESULT", 
-        'confidence': "100% Success Rate",
         'stake': "3/5",
         'analysis': "High corner frequency, both teams attacking"
     },
     '32': {
         'title': "🎯 LIVE TOTAL GOALS SIGNAL 🎯",
         'bet_type': "TOTAL GOALS 3.5 OVER - MATCH RESULT",
-        'confidence': "67% Success Rate", 
-        'stake': "3/5",
+        'stake': "3/5", 
         'analysis': "High scoring game, both teams attacking"
     },
     '41': {
         'title': "🎯 LIVE GOAL SIGNAL 🎯",
         'bet_type': "3RD GOAL BEFORE 60' (V2)",
-        'confidence': "73% Success Rate",
         'stake': "4/5", 
         'analysis': "Early goals, high scoring pattern"
     },
     '47': {
         'title': "🎯 LIVE CORNER SIGNAL 🎯",
         'bet_type': "TOTAL CORNERS - FIRST HALF",
-        'confidence': "85% Success Rate",
         'stake': "4/5",
         'analysis': "High corner frequency in first half"
     },
     '48': {
         'title': "🎯 LIVE CORNER SIGNAL 🎯", 
         'bet_type': "TOTAL CORNERS - MATCH RESULT",
-        'confidence': "100% Success Rate",
         'stake': "4/5",
         'analysis': "High corner frequency throughout match"
     }
@@ -127,14 +124,21 @@ user_client = TelegramClient('user_session', API_ID, API_HASH)
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24).hex()
 
-# X Client (Bearer Token ile)
+# X Client (OAuth 1.0a ile - DÜZELTİLDİ)
 x_client = None
 try:
-    if X_BEARER_TOKEN:
-        x_client = tweepy.Client(bearer_token=X_BEARER_TOKEN)
-        logger.info("X Client initialized with Bearer Token")
+    if all([X_CONSUMER_KEY, X_CONSUMER_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET]):
+        x_client = tweepy.Client(
+            consumer_key=X_CONSUMER_KEY,
+            consumer_secret=X_CONSUMER_SECRET,
+            access_token=X_ACCESS_TOKEN,
+            access_token_secret=X_ACCESS_TOKEN_SECRET
+        )
+        logger.info("✅ X Client initialized with OAuth 1.0a")
+    else:
+        logger.warning("❌ X OAuth credentials missing - some environment variables not set")
 except Exception as e:
-    logger.error(f"X Client Init Error: {e}")
+    logger.error(f"❌ X Client Init Error: {e}")
 
 bot_running = True 
 
@@ -270,7 +274,7 @@ def get_channels_sync(t):
     return channels
 
 # ----------------------------------------------------------------------
-# 3. SİNYAL ÇIKARMA VE ŞABLONLAMA (PROFESSIONAL TEMPLATES)
+# 3. SİNYAL ÇIKARMA VE ŞABLONLAMA (ALERT CODE OLMADAN)
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
@@ -357,7 +361,7 @@ def find_original_signal_key(current_data):
     return None
 
 def build_telegram_message(data):
-    """PROFESSIONAL TELEGRAM MESSAGE FORMAT"""
+    """PROFESSIONAL TELEGRAM MESSAGE FORMAT (ALERT CODE OLMADAN)"""
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
     
@@ -369,7 +373,6 @@ def build_telegram_message(data):
 ⏰ {data['dakika']}' | 📊 Current Score: {data['maç_skor'].split('(')[-1].replace(')', '') if '(' in data['maç_skor'] else 'Live'}
 
 🎯 {template.get('bet_type', data['tahmin'])}
-⭐ Alert Code: {alert_code} ({template.get('confidence', 'High Confidence')})
 
 📈 Analysis: {template.get('analysis', 'Professional betting signal')}
 💸 Stake: {template.get('stake', '3/5')}
@@ -393,7 +396,7 @@ def build_telegram_live_update(data):
 """
 
 def build_x_tweet(data):
-    """PROFESSIONAL X TWEET FORMAT"""
+    """PROFESSIONAL X TWEET FORMAT (ALERT CODE OLMADAN)"""
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
     
@@ -404,7 +407,6 @@ def build_x_tweet(data):
 {data['lig']}
 
 🎯 {template.get('bet_type', data['tahmin'])}
-⭐ Alert Code: {alert_code}
 
 📈 {template.get('analysis', 'Professional signal')}
 💸 Stake: {template.get('stake', '3/5')}
@@ -452,21 +454,21 @@ def build_x_reply_tweet(data):
 """
 
 def post_to_x_sync(tweet_text, reply_to_id=None):
-    """X'e tweet atar (Bearer Token ile)."""
+    """X'e tweet atar (OAuth 1.0a ile - DÜZELTİLDİ)."""
     try:
         if not x_client: 
-            logger.warning("X Client not available")
+            logger.warning("❌ X Client not available")
             return None
             
         if reply_to_id:
             response = x_client.create_tweet(text=tweet_text, in_reply_to_tweet_id=reply_to_id)
-            logger.info(f"X Reply: {response.data['id']}")
+            logger.info(f"✅ X Reply: {response.data['id']}")
         else:
             response = x_client.create_tweet(text=tweet_text)
-            logger.info(f"X Tweet: {response.data['id']}")
+            logger.info(f"✅ X Tweet: {response.data['id']}")
         return response.data['id']
     except Exception as e:
-        logger.error(f"X Post Error: {e}")
+        logger.error(f"❌ X Post Error: {e}")
         return None
 
 async def post_to_x_async(text, reply_id=None):
@@ -557,16 +559,16 @@ async def channel_handler(event):
                 await post_to_x_async(x_live_tweet, tweet_id)
     
     else:
-        # YENİ SİNYAL - PROFESSIONAL FORMAT
+        # YENİ SİNYAL - PROFESSIONAL FORMAT (ALERT CODE OLMADAN)
         if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
         if await asyncio.to_thread(get_signal_data, signal_key): return
 
         logger.info(f"New Signal Found: {signal_key}")
 
-        # X - Professional Format
+        # X - Professional Format (Alert Code Olmadan)
         tweet_id = await post_to_x_async(build_x_tweet(data))
         
-        # Telegram - Professional Format
+        # Telegram - Professional Format (Alert Code Olmadan)
         target_message_id = None
         targets = get_channels_sync('target')
         for t in targets:
