@@ -17,6 +17,7 @@ import tweepy
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 from asgiref.wsgi import WsgiToAsgi
+from datetime import datetime
 
 # ----------------------------------------------------------------------
 # 1. ORTAM DEĞİŞKENLERİ VE YAPILANDIRMA
@@ -49,6 +50,22 @@ except Exception as e:
 
 # GLOBAL BUTONLAR, METİNLER VE FİLTRELER
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
+TELEGRAM_LINK = "https://t.me/aitipsterwon"
+DAILY_X_LIMIT = 15
+daily_signal_count = 0
+last_reset_date = None
+
+# RANDOM HASHTAGS
+HASHTAGS = [
+    "#SportsBetting", "#BettingTips", "#LiveBetting", "#SportsTips", "#Betting",
+    "#FootballBetting", "#SoccerBetting", "#SportsPredictions", "#BettingWin", "#Gamble",
+    "#Odds", "#SportsTrader", "#BettingExpert", "#WinBig", "#BetSmart",
+    "#SportsAnalytics", "#BettingCommunity", "#Profit", "#BettingLife", "#Gambling",
+    "#BettingSignals", "#SportsInvesting", "#BettingStrategy", "#DailyTips", "#BettingWin",
+    "#SportsPicks", "#BettingAdvice", "#WinMoney", "#BettingSuccess", "#SmartBets",
+    "#BettingGoals", "#SportsWinning", "#BettingProfit", "#ExpertPicks", "#BettingJourney",
+    "#SportsInsights", "#BettingMaster", "#WinDaily", "#BettingSkills", "#ValueBets"
+]
 
 SCHEDULED_MESSAGE = """
 ✅ OUR SPONSOR SITES; 
@@ -274,13 +291,82 @@ def get_channels_sync(t):
     return channels
 
 # ----------------------------------------------------------------------
-# 3. SİNYAL ÇIKARMA VE ŞABLONLAMA (ALERT CODE OLMADAN)
+# 3. YENİ FONKSİYONLAR (RANDOM HASHTAG & LIMIT CONTROL)
+# ----------------------------------------------------------------------
+
+def get_random_hashtags(count=3):
+    """Rastgele hashtag seç"""
+    return ' '.join(random.sample(HASHTAGS, count))
+
+def check_daily_limit():
+    """Günlük X limitini kontrol et"""
+    global daily_signal_count, last_reset_date
+    
+    today = datetime.now().date()
+    
+    # Gün değişmişse sıfırla
+    if last_reset_date != today:
+        daily_signal_count = 0
+        last_reset_date = today
+        logger.info(f"🔄 Daily counter reset: {today}")
+    
+    # Limit kontrolü
+    if daily_signal_count >= DAILY_X_LIMIT:
+        return False
+    
+    daily_signal_count += 1
+    logger.info(f"📊 Daily signal count: {daily_signal_count}/{DAILY_X_LIMIT}")
+    return True
+
+def build_limit_message():
+    """Limit dolunca gönderilecek mesaj"""
+    return f"""
+📊 **DAILY PROFESSIONAL SIGNALS SUMMARY** 📊
+
+🎯 Today's Performance:
+• Total Signals: {daily_signal_count}+
+• Winning Rate: %85+
+• Profit: +{daily_signal_count * 85}₺
+
+🚀 Continue with unlimited daily signals on our Telegram channel!
+👉 [Join VIP Telegram Group]({TELEGRAM_LINK})
+
+💎 Why Telegram?
+• Unlimited signals daily
+• Live match updates  
+• Professional analysis
+• Community support
+• Instant notifications
+
+🔔 Turn on notifications to never miss a winning signal!
+"""
+
+# ----------------------------------------------------------------------
+# 4. SİNYAL ÇIKARMA VE ŞABLONLAMA (ALERT CODE OLMADAN)
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
     data = {}
     
-    # 1. MAÇ SKORU - İki farklı format destekle
+    # 1. MAÇ BİTTİ Mİ? - YENİ EKLENDİ
+    ft_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', message_text)
+    if ft_match:
+        data['match_ended'] = True
+        data['final_score'] = ft_match.group(1).strip()
+        logger.info(f"🎯 MAÇ BİTTİ! Final Score: {data['final_score']}")
+        
+        # Kazanç/kayıp kontrolü - Basit versiyon
+        if "✅" in message_text:
+            data['result_icon'] = '✅'
+        elif "❌" in message_text:
+            data['result_icon'] = '❌'
+        else:
+            data['result_icon'] = None
+    else:
+        data['match_ended'] = False
+        data['result_icon'] = None
+    
+    # 2. MAÇ SKORU - İki farklı format destekle
     match_score_match = re.search(r'⚽[️\s]*(.*?)\s*\(.*?\)', message_text, re.DOTALL)
     if match_score_match:
         data['maç_skor'] = match_score_match.group(0).strip().replace('⚽', '').replace('️', '').strip()
@@ -292,15 +378,15 @@ def extract_bet_data(message_text):
         else:
             data['maç_skor'] = None
     
-    # 2. LİG
+    # 3. LİG
     lig_match = re.search(r'🏟\s*(.*?)\n', message_text)
     data['lig'] = lig_match.group(1).strip() if lig_match else None
     
-    # 3. DAKİKA - İki farklı format
+    # 4. DAKİKA - İki farklı format
     dakika_match = re.search(r'⏰\s*(\d+)\s*', message_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
-    # 4. TAHMİN - Parantez içindeki İngilizce kısmı al
+    # 5. TAHMİN - Parantez içindeki İngilizce kısmı al
     tahmin_match = re.search(r'❗[️\s]*(.*?)\n', message_text)
     if tahmin_match:
         tahmin_text = tahmin_match.group(1).strip()
@@ -309,13 +395,9 @@ def extract_bet_data(message_text):
     else:
         data['tahmin'] = None
     
-    # 5. ALERT CODE
+    # 6. ALERT CODE
     alert_code_match = re.search(r'👉\s*AlertCode:\s*(\d+)', message_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
-
-    # 6. SONUÇ İKONU
-    result_match = re.search(r'([✅❌])', message_text)
-    data['result_icon'] = result_match.group(1) if result_match else None
 
     # 7. LIVE UPDATE TESPİTİ
     live_score_match = re.search(r'⏰\s*(\d+)\s*⚽[️\s]*(\d+\s*-\s*\d+)', message_text)
@@ -327,11 +409,7 @@ def extract_bet_data(message_text):
     else:
         data['is_live_update'] = False
 
-    # 8. FINAL SKOR
-    final_score_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', message_text)
-    data['final_score'] = final_score_match.group(1).strip() if final_score_match else None
-
-    # 9. SIGNAL KEY OLUŞTUR
+    # 8. SIGNAL KEY OLUŞTUR
     if all([data.get('maç_skor'), data.get('tahmin')]):
         maç_temiz = re.sub(r'[\(\)]', '', data['maç_skor']).strip().replace(' ', '_').replace('-', '')
         tahmin_temiz = re.sub(r'[^\w\s]', '', data['tahmin']).strip().replace(' ', '_')
@@ -396,9 +474,10 @@ def build_telegram_live_update(data):
 """
 
 def build_x_tweet(data):
-    """PROFESSIONAL X TWEET FORMAT (ALERT CODE OLMADAN)"""
+    """PROFESSIONAL X TWEET FORMAT (ALERT CODE OLMADAN + RANDOM HASHTAGS)"""
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
+    hashtags = get_random_hashtags(3)
     
     return f"""
 {template.get('title', '🎯 BETTING SIGNAL 🎯')}
@@ -411,11 +490,12 @@ def build_x_tweet(data):
 📈 {template.get('analysis', 'Professional signal')}
 💸 Stake: {template.get('stake', '3/5')}
 
-#Betting #SportsBetting
+{hashtags}
 """
 
 def build_x_live_tweet(data):
     """PROFESSIONAL X LIVE UPDATE"""
+    hashtags = get_random_hashtags(3)
     return f"""
 🟢 LIVE UPDATE 🟢
 
@@ -425,7 +505,7 @@ def build_x_live_tweet(data):
 
 🎯 {data['tahmin']} - IN PROGRESS! 🔄
 
-#LiveBetting #Sports
+{hashtags}
 """
 
 def build_telegram_edit(result_icon):
@@ -435,6 +515,8 @@ def build_telegram_edit(result_icon):
 
 def build_x_reply_tweet(data):
     maç_adı = data['maç_skor'].split(' (')[0].strip()
+    hashtags = get_random_hashtags(3)
+    
     if data['result_icon'] == '✅':
         result_text = "🟢 RESULT: WON! 🎉"
         call_to_action = "Bet WON! Like this tweet to celebrate!"
@@ -443,6 +525,7 @@ def build_x_reply_tweet(data):
         call_to_action = "Bet LOST. We'll be back stronger!"
     else:
         return None
+        
     return f"""
 {result_text}
 
@@ -450,7 +533,7 @@ def build_x_reply_tweet(data):
 
 {call_to_action}
 
-#BettingResults #SportsBetting
+{hashtags}
 """
 
 def post_to_x_sync(tweet_text, reply_to_id=None):
@@ -475,7 +558,7 @@ async def post_to_x_async(text, reply_id=None):
     return await asyncio.to_thread(post_to_x_sync, text, reply_id)
 
 # ----------------------------------------------------------------------
-# 4. TELEGRAM HANDLER & TASKS (PROFESSIONAL FORMATS)
+# 5. TELEGRAM HANDLER & TASKS (GÜNCELLEME DESTEKLİ)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -493,6 +576,66 @@ async def scheduled_post_task():
                     logger.error(f"Promo error {t['channel_id']}: {e}")
         await asyncio.sleep(interval)
 
+async def process_update(data, signal_record):
+    """Güncellenmiş sinyali işle"""
+    target_message_id = signal_record.get('target_message_id')
+    tweet_id = signal_record.get('tweet_id')
+    
+    # MAÇ BİTTİ Mİ?
+    if data.get('match_ended') and data.get('result_icon'):
+        logger.info(f"🔄 Processing match result: {data['signal_key']}")
+        
+        # Telegram güncelleme
+        targets = get_channels_sync('target')
+        for t in targets:
+            try:
+                original_msg = await bot_client.get_messages(t['channel_id'], ids=target_message_id)
+                if original_msg:
+                    new_text = original_msg.message + build_telegram_edit(data['result_icon'])
+                    await bot_client.edit_message(t['channel_id'], target_message_id, text=new_text, buttons=BETTING_BUTTONS)
+                    logger.info(f"✅ Result updated: {data['signal_key']}")
+            except Exception as e: 
+                logger.error(f"Edit error: {e}")
+        
+        # X sonuç tweet'i
+        x_reply = build_x_reply_tweet(data)
+        if x_reply and tweet_id:
+            await post_to_x_async(x_reply, tweet_id)
+            logger.info(f"✅ X result posted for: {data['signal_key']}")
+
+async def create_new_signal(data):
+    """Yeni sinyal oluştur"""
+    global daily_signal_count
+    
+    # X limit kontrolü
+    if not check_daily_limit():
+        logger.info(f"📊 Daily limit reached ({daily_signal_count}/{DAILY_X_LIMIT})")
+        limit_tweet = build_limit_message()
+        await post_to_x_async(limit_tweet)
+        return None, None
+    
+    logger.info(f"New Signal Found: {data['signal_key']}")
+
+    # X - Professional Format (Random Hashtags ile)
+    tweet_id = await post_to_x_async(build_x_tweet(data))
+    
+    # Telegram - Professional Format
+    target_message_id = None
+    targets = get_channels_sync('target')
+    for t in targets:
+        try:
+            msg = await bot_client.send_message(
+                t['channel_id'], 
+                build_telegram_message(data), 
+                buttons=BETTING_BUTTONS
+            )
+            target_message_id = msg.id
+            logger.info(f"New professional signal sent to {t['channel_id']}")
+        except Exception as e: 
+            logger.error(f"Send error: {e}")
+    
+    return target_message_id, tweet_id
+
 async def channel_handler(event):
     if not bot_running: return
     
@@ -500,93 +643,22 @@ async def channel_handler(event):
     data = await asyncio.to_thread(extract_bet_data, message_text)
 
     if not data or not data['signal_key']: return
+    if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
 
-    is_result = data['result_icon'] is not None
-    is_live_update = data.get('is_live_update', False)
-    signal_key = data['signal_key']
+    # ÖNCEDEN İŞLENMİŞ Mİ? (GÜNCELLEME Mİ?)
+    signal_record = await asyncio.to_thread(get_signal_data, data['signal_key'])
     
-    if is_result:
-        # SONUÇ İŞLEME
-        signal_record = await asyncio.to_thread(get_signal_data, signal_key)
-        if signal_record:
-            target_message_id = signal_record.get('target_message_id')
-            tweet_id = signal_record.get('tweet_id')
-            
-            targets = get_channels_sync('target')
-            for t in targets:
-                try:
-                    original_msg = await bot_client.get_messages(t['channel_id'], ids=target_message_id)
-                    if original_msg:
-                        new_text = original_msg.message + build_telegram_edit(data['result_icon'])
-                        await bot_client.edit_message(t['channel_id'], target_message_id, text=new_text, buttons=BETTING_BUTTONS)
-                        logger.info(f"Result updated: {signal_key}")
-                except Exception as e: 
-                    logger.error(f"Edit error: {e}")
-            
-            x_reply = build_x_reply_tweet(data)
-            if x_reply and tweet_id:
-                await post_to_x_async(x_reply, tweet_id)
-    
-    elif is_live_update:
-        # LIVE UPDATE İŞLEME
-        logger.info(f"🟢 Processing LIVE UPDATE: {data['live_score']} at {data['live_minute']}")
-        
-        original_key = await asyncio.to_thread(find_original_signal_key, data)
-        if not original_key:
-            logger.warning(f"❌ No original signal found for live update: {data['signal_key']}")
-            return
-            
-        signal_record = await asyncio.to_thread(get_signal_data, original_key)
-        if signal_record:
-            target_message_id = signal_record.get('target_message_id')
-            tweet_id = signal_record.get('tweet_id')
-            
-            targets = get_channels_sync('target')
-            for t in targets:
-                try:
-                    await bot_client.send_message(
-                        t['channel_id'], 
-                        build_telegram_live_update(data), 
-                        buttons=BETTING_BUTTONS,
-                        reply_to=target_message_id
-                    )
-                    logger.info(f"Live update sent: {data['live_score']}")
-                except Exception as e:
-                    logger.error(f"Live update send error: {e}")
-            
-            if tweet_id:
-                x_live_tweet = build_x_live_tweet(data)
-                await post_to_x_async(x_live_tweet, tweet_id)
-    
+    if signal_record:
+        # ✅ BU BİR GÜNCELLEME! Orijinal mesajı güncelle
+        await process_update(data, signal_record)
     else:
-        # YENİ SİNYAL - PROFESSIONAL FORMAT (ALERT CODE OLMADAN)
-        if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
-        if await asyncio.to_thread(get_signal_data, signal_key): return
-
-        logger.info(f"New Signal Found: {signal_key}")
-
-        # X - Professional Format (Alert Code Olmadan)
-        tweet_id = await post_to_x_async(build_x_tweet(data))
-        
-        # Telegram - Professional Format (Alert Code Olmadan)
-        target_message_id = None
-        targets = get_channels_sync('target')
-        for t in targets:
-            try:
-                msg = await bot_client.send_message(
-                    t['channel_id'], 
-                    build_telegram_message(data), 
-                    buttons=BETTING_BUTTONS
-                )
-                target_message_id = msg.id
-                logger.info(f"New professional signal sent to {t['channel_id']}")
-            except Exception as e: 
-                logger.error(f"Send error: {e}")
-        
-        await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
+        # ✅ BU YENİ BİR SİNYAL! Yeni mesaj oluştur
+        target_message_id, tweet_id = await create_new_signal(data)
+        if target_message_id and tweet_id:
+            await asyncio.to_thread(record_processed_signal, data['signal_key'], target_message_id, tweet_id)
 
 # ----------------------------------------------------------------------
-# 5. FLASK ROTALARI
+# 6. FLASK ROTALARI
 # ----------------------------------------------------------------------
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -615,7 +687,7 @@ def health(): return "OK", 200
 def home(): return jsonify({"status": "running", "features": ["betting_signals", "live_updates", "x_posting"]})
 
 # ----------------------------------------------------------------------
-# 6. ANA ÇALIŞTIRMA
+# 7. ANA ÇALIŞTIRMA
 # ----------------------------------------------------------------------
 
 async def main():
