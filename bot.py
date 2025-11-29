@@ -111,7 +111,7 @@ LOGIN_FORM = """<!doctype html><title>Login</title><h2>Phone</h2><form method=po
 CODE_FORM = """<!doctype html><title>Code</title><h2>Enter Code</h2><form method=post><input name=code placeholder=12345 required><button>Login</button></form>"""
 
 # ----------------------------------------------------------------------
-# 2. VERİTABANI YÖNETİMİ (ID SİSTEMİ EKLENDİ)
+# 2. VERİTABANI YÖNETİMİ (GÜÇLENDİRİLMİŞ TABLO DÜZELTME)
 # ----------------------------------------------------------------------
 
 def get_connection():
@@ -125,30 +125,45 @@ def init_db_sync():
     conn = None
     try:
         conn = get_connection()
+        conn.autocommit = True # Otomatik commit aç
         cur = conn.cursor()
         
-        # Ana Tablo
+        # 1. Ana Tabloyu Oluştur (Yoksa)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS processed_signals (
                 signal_key TEXT PRIMARY KEY,
                 source_channel TEXT NOT NULL,
                 target_message_id BIGINT,
                 tweet_id BIGINT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'PENDING',
-                source_message_id BIGINT
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         
-        # MIGRATION: Eğer tablo varsa ve sütun eksikse ekle
+        # 2. EKSİK SÜTUNLARI ZORLA EKLE (Hata yakalama ile)
+        # Status sütunu
         try:
-            cur.execute("ALTER TABLE processed_signals ADD COLUMN IF NOT EXISTS source_message_id BIGINT;")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_source_msg_id ON processed_signals(source_message_id);")
-            conn.commit()
-        except:
-            conn.rollback()
+            cur.execute("ALTER TABLE processed_signals ADD COLUMN status TEXT DEFAULT 'PENDING';")
+            logger.info("✅ 'status' sütunu tabloya eklendi.")
+        except psycopg2.errors.DuplicateColumn:
+            logger.info("ℹ️ 'status' sütunu zaten var.")
+        except Exception as e:
+            logger.error(f"⚠️ Status sütunu hatası: {e}")
 
-        # Günlük Sayaç Tablosu
+        # Source Message ID sütunu
+        try:
+            cur.execute("ALTER TABLE processed_signals ADD COLUMN source_message_id BIGINT;")
+            logger.info("✅ 'source_message_id' sütunu tabloya eklendi.")
+        except psycopg2.errors.DuplicateColumn:
+            logger.info("ℹ️ 'source_message_id' sütunu zaten var.")
+        except Exception as e:
+            logger.error(f"⚠️ Source ID sütunu hatası: {e}")
+
+        # Index oluştur
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_source_msg_id ON processed_signals(source_message_id);")
+        except: pass
+
+        # 3. Diğer Tablolar
         cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_stats (
                 date DATE PRIMARY KEY,
@@ -156,7 +171,6 @@ def init_db_sync():
             );
         """)
         
-        # Kanallar Tablosu
         cur.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id SERIAL PRIMARY KEY,
@@ -165,14 +179,14 @@ def init_db_sync():
                 channel_type TEXT
             );
         """)
-        conn.commit()
-        logger.info("✅ DB Tables Ready")
+        
+        logger.info("✅ DB Tables & Columns Verified")
     except Exception as e:
         logger.error(f"DB Init Error: {e}")
     finally:
         if conn: conn.close()
 
-# 🔥 YENİ FONKSİYON: ID İLE ARAMA 🔥
+# ID İLE ARAMA
 def get_signal_by_source_id(source_msg_id):
     conn = get_connection()
     try:
@@ -185,11 +199,12 @@ def get_signal_by_source_id(source_msg_id):
     finally:
         if conn: conn.close()
 
-# 🔥 GÜNCELLENMİŞ KAYIT FONKSİYONU 🔥
+# KAYIT FONKSİYONU
 def record_processed_signal(signal_key, target_message_id, tweet_id, source_message_id):
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # Önce sütunların varlığını garantiye alacak bir sorgu yapısı
             cur.execute("""
                 INSERT INTO processed_signals (signal_key, source_channel, target_message_id, tweet_id, status, source_message_id) 
                 VALUES (%s, %s, %s, %s, 'PENDING', %s) 
@@ -204,6 +219,19 @@ def record_processed_signal(signal_key, target_message_id, tweet_id, source_mess
     except Exception as e:
         logger.error(f"❌ Record Signal Error: {e}")
         return False
+    finally:
+        if conn: conn.close()
+
+# ESKİ TİP ARAMA (Yedek)
+def get_signal_data(signal_key):
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT target_message_id, tweet_id FROM processed_signals WHERE signal_key = %s", (signal_key,))
+            result = cur.fetchone()
+            return dict(result) if result else None
+    except Exception as e:
+        return None
     finally:
         if conn: conn.close()
 
@@ -257,22 +285,23 @@ def get_channels_sync(t):
 def extract_bet_data(message_text):
     data = {}
     
-    # Skor
-    match_score_match = re.search(r'⚽[️\s]*(.*?)\s*\(.*?\)', message_text, re.DOTALL)
+    # Temizlik
+    cleaned_text = re.sub(r'^\d+\s*-\s*\d+[\s\n]*', '', message_text)
+    
+    match_score_match = re.search(r'⚽[️\s]*(.*?)\s*\(.*?\)', cleaned_text, re.DOTALL)
     if match_score_match:
         data['maç_skor'] = match_score_match.group(0).strip().replace('⚽', '').replace('️', '').strip()
     else:
-        match_alt = re.search(r'([A-Za-z\s]+-\s*[A-Za-z\s]+)\s*\(\s*(\d+\s*-\s*\d+)\s*\)', message_text)
+        match_alt = re.search(r'([A-Za-z\s]+-\s*[A-Za-z\s]+)\s*\(\s*(\d+\s*-\s*\d+)\s*\)', cleaned_text)
         data['maç_skor'] = f"{match_alt.group(1)} ({match_alt.group(2)})" if match_alt else None
     
-    # Lig, Dakika, Tahmin
-    lig_match = re.search(r'🏟\s*(.*?)\n', message_text)
+    lig_match = re.search(r'🏟\s*(.*?)\n', cleaned_text)
     data['lig'] = lig_match.group(1).strip() if lig_match else None
     
-    dakika_match = re.search(r'⏰\s*(\d+)\s*', message_text)
+    dakika_match = re.search(r'⏰\s*(\d+)\s*', cleaned_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
-    tahmin_match = re.search(r'❗[️\s]*(.*?)\n', message_text)
+    tahmin_match = re.search(r'❗[️\s]*(.*?)\n', cleaned_text)
     if tahmin_match:
         tahmin_text = tahmin_match.group(1).strip()
         corner_match = re.search(r'(\d+\.?\d*)\s*(üst|over|alt|under)', tahmin_text, re.IGNORECASE)
@@ -285,14 +314,14 @@ def extract_bet_data(message_text):
     else:
         data['tahmin'] = None
     
-    alert_code_match = re.search(r'👉\s*AlertCode:\s*(\d+)', message_text)
+    alert_code_match = re.search(r'👉\s*AlertCode:\s*(\d+)', cleaned_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
     
-    result_match = re.search(r'([✅❌])', message_text)
+    result_match = re.search(r'([✅❌])', cleaned_text)
     data['result_icon'] = result_match.group(1) if result_match else None
 
     # Live Update
-    live_score_match = re.search(r'⏰\s*(\d+)\s*⚽[️\s]*(\d+\s*-\s*\d+)', message_text)
+    live_score_match = re.search(r'⏰\s*(\d+)\s*⚽[️\s]*(\d+\s*-\s*\d+)', cleaned_text)
     if live_score_match:
         data['live_minute'] = live_score_match.group(1).strip()
         data['live_score'] = live_score_match.group(2).strip()
@@ -300,22 +329,20 @@ def extract_bet_data(message_text):
     else:
         data['is_live_update'] = False
 
-    # Maç Bitti mi?
-    ft_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', message_text)
+    ft_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', cleaned_text)
     if ft_match:
         data['match_ended'] = True
         data['final_score'] = ft_match.group(1).strip()
     else:
         data['match_ended'] = False
 
-    # Signal Key
-    if all([data.get('maç_skor'), data.get('tahmin')]):
-        maç_temiz = re.sub(r'[\(\)]', '', data['maç_skor']).strip().replace(' ', '_').replace('-', '')
+    if all([data.get('maç_skor'), data.get('tahmin'), data.get('alert_code')]):
+        # Maç adı + Alert Code ile daha güvenli bir key
+        maç_adı = data['maç_skor'].split(' (')[0].strip()
+        maç_temiz = re.sub(r'[^A-Za-z\s]', '', maç_adı).strip().replace(' ', '_')
         tahmin_temiz = re.sub(r'[^\w\s]', '', data['tahmin']).strip().replace(' ', '_')
-        if data.get('dakika'):
-            data['signal_key'] = f"{maç_temiz}_{data['dakika']}_{tahmin_temiz}"
-        else:
-            data['signal_key'] = f"{maç_temiz}_{tahmin_temiz}"
+        
+        data['signal_key'] = f"{maç_temiz}_{data['alert_code']}_{tahmin_temiz}"
     else:
         data['signal_key'] = None
     
@@ -438,7 +465,7 @@ async def post_to_x_async(text, reply_id=None):
     return await asyncio.to_thread(post_to_x_sync, text, reply_id)
 
 # ----------------------------------------------------------------------
-# 4. HANDLER (MESAJ ID ve DÜZENLEME MANTIĞI)
+# 4. HANDLER (MESAJ ID SİSTEMİ)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -454,7 +481,7 @@ async def scheduled_post_task():
         await asyncio.sleep(interval)
 
 async def process_match_result(data, signal_record):
-    """Maç sonucunu işle (Edit + Reply)"""
+    """Maç sonucunu işle"""
     target_message_id = signal_record.get('target_message_id')
     tweet_id = signal_record.get('tweet_id')
     
@@ -464,10 +491,10 @@ async def process_match_result(data, signal_record):
             await bot_client.edit_message(
                 t['channel_id'], 
                 target_message_id, 
-                text=build_telegram_message(data), # Yeni skorla güncelle
+                text=build_telegram_message(data),
                 buttons=BETTING_BUTTONS
             )
-            logger.info(f"✅ Telegram UPDATED (Result): {data['signal_key']}")
+            logger.info(f"✅ Telegram message UPDATED for result")
         except Exception as e: 
             logger.error(f"❌ Telegram Edit error: {e}")
     
@@ -476,7 +503,7 @@ async def process_match_result(data, signal_record):
         await post_to_x_async(x_reply, tweet_id)
 
 async def process_live_update(data, signal_record):
-    """Canlı güncelleme (Edit değil, Reply at)"""
+    """Live update işle"""
     target_message_id = signal_record.get('target_message_id')
     tweet_id = signal_record.get('tweet_id')
     
@@ -494,25 +521,10 @@ async def process_live_update(data, signal_record):
     if tweet_id:
         await post_to_x_async(build_x_live_tweet(data), tweet_id)
 
-async def process_general_update(data, signal_record):
-    """Sadece skor/dakika değiştiyse mesajı güncelle"""
-    target_message_id = signal_record.get('target_message_id')
-    targets = get_channels_sync('target')
-    for t in targets:
-        try:
-            await bot_client.edit_message(
-                t['channel_id'], 
-                target_message_id, 
-                text=build_telegram_message(data),
-                buttons=BETTING_BUTTONS
-            )
-            logger.info(f"✏️ Telegram UPDATED (General): {data['signal_key']}")
-        except: pass
-
 async def channel_handler(event):
     if not bot_running: return
     
-    # 🔥 1. MESAJ ID'SİNİ AL (KİMLİK NUMARASI) 🔥
+    # 1. MESAJ ID AL
     source_msg_id = event.id
     
     message_text = event.raw_text.strip()
@@ -521,7 +533,7 @@ async def channel_handler(event):
     if not data or not data['signal_key']: return
     if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
 
-    # 🔥 2. ID İLE VERİTABANINDA ARA 🔥
+    # 2. ID İLE VERİTABANINDA ARA
     signal_record = await asyncio.to_thread(get_signal_by_source_id, source_msg_id)
     
     # --- DURUM A: ZATEN VAR (GÜNCELLEME) ---
@@ -533,17 +545,29 @@ async def channel_handler(event):
         elif data.get('is_live_update'):
             await process_live_update(data, signal_record)
         else:
-            await process_general_update(data, signal_record)
+            # Sadece skor/korner sayısı değiştiyse mesajı güncelle
+            # Eski mesajı güncellemek için
+            target_message_id = signal_record.get('target_message_id')
+            targets = get_channels_sync('target')
+            for t in targets:
+                try:
+                    await bot_client.edit_message(
+                        t['channel_id'], 
+                        target_message_id, 
+                        text=build_telegram_message(data),
+                        buttons=BETTING_BUTTONS
+                    )
+                    logger.info("✏️ Telegram Update: Minor change")
+                except: pass
 
     # --- DURUM B: YOK (YENİ SİNYAL) ---
     else:
-        # Eğer bu bir 'Edit' eventiyse ve veritabanında yoksa, eski bir mesajdır, işlem yapma.
+        # Editlenen ama bizde olmayan mesajları YENİ sanıp atma
         if isinstance(event, events.MessageEdited):
             return
 
         logger.info(f"🆕 YENİ SİNYAL (ID: {source_msg_id})")
 
-        # X Limit
         current_count = await asyncio.to_thread(get_daily_tweet_count)
         tweet_id = None
         
@@ -556,7 +580,6 @@ async def channel_handler(event):
                         await post_to_x_async(CLOSING_TWEET_TEXT)
             except: pass
 
-        # Telegram
         target_message_id = None
         targets = get_channels_sync('target')
         for t in targets:
@@ -566,7 +589,7 @@ async def channel_handler(event):
             except Exception as e: 
                 logger.error(f"Telegram Send error: {e}")
         
-        # 🔥 3. ID İLE KAYDET 🔥
+        # 3. ID İLE KAYDET
         if target_message_id:
             await asyncio.to_thread(record_processed_signal, data['signal_key'], target_message_id, tweet_id, source_msg_id)
 
@@ -609,7 +632,6 @@ async def main():
         await user_client.connect()
         source_ids = [c['channel_id'] for c in get_channels_sync('source')]
         
-        # Hem YENİ hem DÜZENLENMİŞ mesajları dinle
         user_client.add_event_handler(channel_handler, events.NewMessage(incoming=True, chats=source_ids))
         user_client.add_event_handler(channel_handler, events.MessageEdited(chats=source_ids))
         
