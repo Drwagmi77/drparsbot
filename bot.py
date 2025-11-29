@@ -5,6 +5,7 @@ import logging
 import time
 import tweepy
 import psycopg2
+from datetime import date
 from psycopg2.extras import RealDictCursor
 from telethon import TelegramClient, events, Button
 from flask import Flask, jsonify, request, redirect, session, render_template_string
@@ -19,7 +20,6 @@ from asgiref.wsgi import WsgiToAsgi
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Ortam değişkenlerinden çekilir
 try:
     API_ID = int(os.environ.get("API_ID"))
     API_HASH = os.environ.get("API_HASH")
@@ -31,7 +31,6 @@ try:
     DB_USER = os.environ.get("DB_USER")
     DB_PASS = os.environ.get("DB_PASS")
     
-    # X (Twitter) API Keys
     X_CONSUMER_KEY = os.environ.get("X_CONSUMER_KEY")
     X_CONSUMER_SECRET = os.environ.get("X_CONSUMER_SECRET")
     X_ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN")
@@ -41,8 +40,20 @@ try:
 except Exception as e:
     logger.critical(f"Missing environment variables: {e}")
 
-# GLOBAL AYARLAR
+# --- GLOBAL AYARLAR ---
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
+DAILY_TWEET_LIMIT = 15  # Limit 15
+
+# LİMİT DOLUNCA ATILACAK KAPANIŞ TWEETİ
+CLOSING_TWEET_TEXT = """🚫 DAILY X LIMIT REACHED (15/15)
+
+🚀 The winning streak continues exclusively on our Telegram channel!
+
+Don't miss the rest of today's high-confidence signals.
+
+👇 JOIN VIP FREE:
+https://t.me/aitipsterwon
+"""
 
 SCHEDULED_MESSAGE = """
 ✅ OUR SPONSOR SITES; 
@@ -65,7 +76,6 @@ BETTING_BUTTONS = [
     ]
 ]
 
-# ALERT ŞABLONLARI
 ALERT_TEMPLATES = {
     '1': {'title': "🎯 LIVE GOAL SIGNAL 🎯", 'bet_type': "NEXT GOAL AFTER 65' (+0.5)", 'stake': "4/5", 'analysis': "High scoring pattern"},
     '17': {'title': "🎯 LIVE TOTAL GOALS SIGNAL 🎯", 'bet_type': "TOTAL GOALS 2.5 OVER BEFORE 60'", 'stake': "4/5", 'analysis': "Fast paced game"},
@@ -76,13 +86,11 @@ ALERT_TEMPLATES = {
     '48': {'title': "🎯 LIVE CORNER SIGNAL 🎯", 'bet_type': "TOTAL CORNERS - MATCH RESULT", 'stake': "4/5", 'analysis': "High corner frequency"}
 }
 
-# Client Tanımları
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 user_client = TelegramClient('user_session', API_ID, API_HASH)
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24).hex()
 
-# X Client Başlatma (OAuth 1.0a)
 x_client = None
 try:
     if all([X_CONSUMER_KEY, X_CONSUMER_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET]):
@@ -100,12 +108,11 @@ except Exception as e:
 
 bot_running = True 
 
-# HTML Formları
 LOGIN_FORM = """<!doctype html><title>Login</title><h2>Phone</h2><form method=post><input name=phone placeholder="+90..." required><button>Send Code</button></form>"""
 CODE_FORM = """<!doctype html><title>Code</title><h2>Enter Code</h2><form method=post><input name=code placeholder=12345 required><button>Login</button></form>"""
 
 # ----------------------------------------------------------------------
-# 2. VERİTABANI VE YARDIMCI FONKSİYONLAR
+# 2. VERİTABANI YÖNETİMİ
 # ----------------------------------------------------------------------
 
 def get_connection():
@@ -120,15 +127,26 @@ def init_db_sync():
     try:
         conn = get_connection()
         cur = conn.cursor()
+        
         cur.execute("""
             CREATE TABLE IF NOT EXISTS processed_signals (
                 signal_key TEXT PRIMARY KEY,
                 source_channel TEXT NOT NULL,
                 target_message_id BIGINT,
                 tweet_id BIGINT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'PENDING'
             );
         """)
+        
+        # Günlük Sayaç Tablosu
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                date DATE PRIMARY KEY,
+                tweet_count INTEGER DEFAULT 0
+            );
+        """)
+        
         cur.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id SERIAL PRIMARY KEY,
@@ -152,7 +170,6 @@ def get_signal_data(signal_key):
             result = cur.fetchone()
             return dict(result) if result else None
     except Exception as e:
-        logger.error(f"Get Signal Error: {e}")
         return None
     finally:
         if conn: conn.close()
@@ -162,8 +179,8 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO processed_signals (signal_key, source_channel, target_message_id, tweet_id) 
-                VALUES (%s, %s, %s, %s) 
+                INSERT INTO processed_signals (signal_key, source_channel, target_message_id, tweet_id, status) 
+                VALUES (%s, %s, %s, %s, 'PENDING') 
                 ON CONFLICT (signal_key) DO UPDATE SET 
                 target_message_id = EXCLUDED.target_message_id, 
                 tweet_id = EXCLUDED.tweet_id;
@@ -177,14 +194,44 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
     finally:
         if conn: conn.close()
 
+def get_daily_tweet_count():
+    conn = get_connection()
+    today = date.today()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tweet_count FROM daily_stats WHERE date = %s", (today,))
+            result = cur.fetchone()
+            return result[0] if result else 0
+    except Exception as e:
+        return 0
+    finally:
+        if conn: conn.close()
+
+def increment_daily_tweet_count():
+    conn = get_connection()
+    today = date.today()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO daily_stats (date, tweet_count) VALUES (%s, 1)
+                ON CONFLICT (date) DO UPDATE SET tweet_count = daily_stats.tweet_count + 1
+                RETURNING tweet_count;
+            """, (today,))
+            new_count = cur.fetchone()[0]
+            conn.commit()
+            return new_count
+    except Exception as e:
+        return 0
+    finally:
+        if conn: conn.close()
+
 def get_all_signal_keys():
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT signal_key FROM processed_signals WHERE target_message_id IS NOT NULL")
             return [row[0] for row in cur.fetchall()]
-    except Exception as e:
-        return []
+    except: return []
     finally:
         if conn: conn.close()
 
@@ -207,7 +254,6 @@ def get_channels_sync(t):
 def extract_bet_data(message_text):
     data = {}
     
-    # Skor
     match_score_match = re.search(r'⚽[️\s]*(.*?)\s*\(.*?\)', message_text, re.DOTALL)
     if match_score_match:
         data['maç_skor'] = match_score_match.group(0).strip().replace('⚽', '').replace('️', '').strip()
@@ -215,7 +261,6 @@ def extract_bet_data(message_text):
         match_alt = re.search(r'([A-Za-z\s]+-\s*[A-Za-z\s]+)\s*\(\s*(\d+\s*-\s*\d+)\s*\)', message_text)
         data['maç_skor'] = f"{match_alt.group(1)} ({match_alt.group(2)})" if match_alt else None
     
-    # Lig, Dakika, Tahmin
     lig_match = re.search(r'🏟\s*(.*?)\n', message_text)
     data['lig'] = lig_match.group(1).strip() if lig_match else None
     
@@ -230,14 +275,12 @@ def extract_bet_data(message_text):
     else:
         data['tahmin'] = None
     
-    # Alert Code ve Sonuç İkonu
     alert_code_match = re.search(r'👉\s*AlertCode:\s*(\d+)', message_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
     
     result_match = re.search(r'([✅❌])', message_text)
     data['result_icon'] = result_match.group(1) if result_match else None
 
-    # Live Update Tespiti
     live_score_match = re.search(r'⏰\s*(\d+)\s*⚽[️\s]*(\d+\s*-\s*\d+)', message_text)
     if live_score_match:
         data['live_minute'] = live_score_match.group(1).strip()
@@ -246,11 +289,9 @@ def extract_bet_data(message_text):
     else:
         data['is_live_update'] = False
 
-    # Final Skor
     final_score_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', message_text)
     data['final_score'] = final_score_match.group(1).strip() if final_score_match else None
 
-    # Signal Key Oluştur (Eşsiz Kimlik)
     if all([data.get('maç_skor'), data.get('tahmin')]):
         maç_temiz = re.sub(r'[\(\)]', '', data['maç_skor']).strip().replace(' ', '_').replace('-', '')
         tahmin_temiz = re.sub(r'[^\w\s]', '', data['tahmin']).strip().replace(' ', '_')
@@ -267,7 +308,6 @@ def find_original_signal_key(current_data):
     all_keys = get_all_signal_keys()
     maç_temiz = re.sub(r'[\(\)]', '', current_data['maç_skor']).strip().replace(' ', '_').replace('-', '')
     tahmin_temiz = re.sub(r'[^\w\s]', '', current_data['tahmin']).strip().replace(' ', '_')
-    
     for key in all_keys:
         if maç_temiz in key and tahmin_temiz in key:
             return key
@@ -341,7 +381,6 @@ def build_x_reply_tweet(data):
         result_text = "🔴 RESULT: LOST! 😔"
     else:
         return None
-    
     return f"""
 {result_text}
 
@@ -352,7 +391,7 @@ FT: {data.get('final_score', 'Finished')}
 """
 
 def post_to_x_sync(tweet_text, reply_to_id=None):
-    """X'e tweet atar (Retry Mekanizmalı - Bağlantı Koparsa 3 Kere Dener)."""
+    """X'e tweet atar (Retry Mekanizmalı - 3 Deneme)."""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -372,7 +411,7 @@ async def post_to_x_async(text, reply_id=None):
     return await asyncio.to_thread(post_to_x_sync, text, reply_id)
 
 # ----------------------------------------------------------------------
-# 4. HANDLER & TASKS (DÜZELTİLEN MANTIK)
+# 4. HANDLER (LİMİT ve OTOMATİK KAPANIŞ)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -407,15 +446,14 @@ async def channel_handler(event):
             target_message_id = signal_record.get('target_message_id')
             tweet_id = signal_record.get('tweet_id')
             
-            # A) TELEGRAM GÜNCELLEMESİ (Eski mesajı silip yenisini basar)
+            # A) TELEGRAM GÜNCELLEMESİ (Tüm mesajı yenisiyle değiştir)
             targets = get_channels_sync('target')
             for t in targets:
                 try:
-                    # Gelen mesajı (✅... #FT...) olduğu gibi basıyoruz
                     await bot_client.edit_message(
                         t['channel_id'], 
                         target_message_id, 
-                        text=message_text, # Orjinal sonuç mesajını bas
+                        text=message_text, # Yeni gelen ✅... mesajını bas
                         buttons=BETTING_BUTTONS
                     )
                     logger.info(f"✅ Telegram message UPDATED for result: {signal_key}")
@@ -429,7 +467,7 @@ async def channel_handler(event):
         else:
             logger.warning(f"⚠️ Result received but signal not found in DB: {signal_key}")
     
-    # --- 2. CANLI GÜNCELLEME (GOL) ---
+    # --- 2. CANLI GÜNCELLEME ---
     elif is_live_update:
         original_key = await asyncio.to_thread(find_original_signal_key, data)
         if original_key:
@@ -454,13 +492,28 @@ async def channel_handler(event):
 
         logger.info(f"🆕 New Signal Found: {signal_key}")
 
-        # X Tweet (Retry ile korunuyor)
+        # --- X LİMİT VE KAPANIŞ KONTROLÜ ---
+        current_count = await asyncio.to_thread(get_daily_tweet_count)
         tweet_id = None
-        try:
-            tweet_id = await post_to_x_async(build_x_tweet(data))
-        except: pass
+        
+        if current_count < DAILY_TWEET_LIMIT:
+            # Limit dolmadı, tweet at
+            try:
+                tweet_id = await post_to_x_async(build_x_tweet(data))
+                if tweet_id:
+                    new_count = await asyncio.to_thread(increment_daily_tweet_count)
+                    logger.info(f"📊 Daily Tweet Count: {new_count}/{DAILY_TWEET_LIMIT}")
+                    
+                    # Eğer tam 15 olduysa KAPANIŞ MESAJINI at
+                    if new_count == DAILY_TWEET_LIMIT:
+                        logger.info("🚫 Limit Reached. Sending Closing Tweet...")
+                        await post_to_x_async(CLOSING_TWEET_TEXT)
+            except: pass
+        else:
+            logger.info("🚫 Daily X Limit reached. Skipping tweet.")
+        # -------------------------------------
 
-        # Telegram Mesajı
+        # Telegram Mesajı (Hep atar)
         target_message_id = None
         targets = get_channels_sync('target')
         for t in targets:
@@ -470,7 +523,7 @@ async def channel_handler(event):
             except Exception as e: 
                 logger.error(f"Telegram Send error: {e}")
         
-        # 🔥 KRİTİK: X hata verse bile DB'ye kaydet!
+        # Veritabanına Kaydet (X atılamasa bile!)
         if target_message_id:
             await asyncio.to_thread(record_processed_signal, signal_key, target_message_id, tweet_id)
 
