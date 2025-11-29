@@ -14,7 +14,7 @@ from hypercorn.config import Config
 from asgiref.wsgi import WsgiToAsgi
 
 # ----------------------------------------------------------------------
-# 1. ORTAM DEĞİŞKENLERİ VE YAPILANDIRMA
+# 1. ORTAM DEĞİŞKENLERİ
 # ----------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -40,7 +40,7 @@ try:
 except Exception as e:
     logger.critical(f"Missing environment variables: {e}")
 
-# --- GLOBAL AYARLAR ---
+# --- AYARLAR ---
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
 DAILY_TWEET_LIMIT = 15
 
@@ -75,14 +75,15 @@ BETTING_BUTTONS = [
     ]
 ]
 
+# (Şablonlar duruyor ama artık Akıllı Başlık kullanacağız)
 ALERT_TEMPLATES = {
-    '1': {'title': "🎯 LIVE GOAL SIGNAL 🎯", 'bet_type': "NEXT GOAL AFTER 65' (+0.5)", 'stake': "4/5", 'analysis': "High scoring pattern"},
-    '17': {'title': "🎯 LIVE TOTAL GOALS SIGNAL 🎯", 'bet_type': "TOTAL GOALS 2.5 OVER BEFORE 60'", 'stake': "4/5", 'analysis': "Fast paced game"},
-    '21': {'title': "🎯 LIVE CORNER SIGNAL 🎯", 'bet_type': "TOTAL CORNERS - MATCH RESULT", 'stake': "3/5", 'analysis': "High corner frequency"},
-    '32': {'title': "🎯 LIVE TOTAL GOALS SIGNAL 🎯", 'bet_type': "TOTAL GOALS 3.5 OVER - MATCH RESULT", 'stake': "3/5", 'analysis': "High scoring game"},
-    '41': {'title': "🎯 LIVE GOAL SIGNAL 🎯", 'bet_type': "3RD GOAL BEFORE 60' (V2)", 'stake': "4/5", 'analysis': "Early goals expected"},
-    '47': {'title': "🎯 LIVE CORNER SIGNAL 🎯", 'bet_type': "TOTAL CORNERS - FIRST HALF", 'stake': "4/5", 'analysis': "High corner frequency"},
-    '48': {'title': "🎯 LIVE CORNER SIGNAL 🎯", 'bet_type': "TOTAL CORNERS - MATCH RESULT", 'stake': "4/5", 'analysis': "High corner frequency"}
+    '1': {'bet_type': "NEXT GOAL AFTER 65' (+0.5)", 'stake': "4/5", 'analysis': "High scoring pattern"},
+    '17': {'bet_type': "TOTAL GOALS 2.5 OVER BEFORE 60'", 'stake': "4/5", 'analysis': "Fast paced game"},
+    '21': {'bet_type': "TOTAL CORNERS - MATCH RESULT", 'stake': "3/5", 'analysis': "High corner frequency"},
+    '32': {'bet_type': "TOTAL GOALS 3.5 OVER - MATCH RESULT", 'stake': "3/5", 'analysis': "High scoring game"},
+    '41': {'bet_type': "3RD GOAL BEFORE 60' (V2)", 'stake': "4/5", 'analysis': "Early goals expected"},
+    '47': {'bet_type': "TOTAL CORNERS - FIRST HALF", 'stake': "4/5", 'analysis': "High corner frequency"},
+    '48': {'bet_type': "TOTAL CORNERS - MATCH RESULT", 'stake': "4/5", 'analysis': "High corner frequency"}
 }
 
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
@@ -99,19 +100,16 @@ try:
             access_token=X_ACCESS_TOKEN,
             access_token_secret=X_ACCESS_TOKEN_SECRET
         )
-        logger.info("✅ X Client initialized with OAuth 1.0a")
+        logger.info("✅ X Client initialized")
     else:
-        logger.warning("❌ X Credentials missing in ENV")
+        logger.warning("❌ X Credentials missing")
 except Exception as e:
     logger.error(f"❌ X Init Error: {e}")
 
 bot_running = True 
 
-LOGIN_FORM = """<!doctype html><title>Login</title><h2>Phone</h2><form method=post><input name=phone placeholder="+90..." required><button>Send Code</button></form>"""
-CODE_FORM = """<!doctype html><title>Code</title><h2>Enter Code</h2><form method=post><input name=code placeholder=12345 required><button>Login</button></form>"""
-
 # ----------------------------------------------------------------------
-# 2. VERİTABANI YÖNETİMİ
+# 2. VERİTABANI
 # ----------------------------------------------------------------------
 
 def get_connection():
@@ -140,11 +138,8 @@ def init_db_sync():
             );
         """)
         
-        # MIGRATION
         try:
             cur.execute("ALTER TABLE processed_signals ADD COLUMN status TEXT DEFAULT 'PENDING';")
-        except: pass
-        try:
             cur.execute("ALTER TABLE processed_signals ADD COLUMN source_message_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_source_msg_id ON processed_signals(source_message_id);")
         except: pass
@@ -164,7 +159,7 @@ def init_db_sync():
                 channel_type TEXT
             );
         """)
-        logger.info("✅ DB Tables Ready")
+        logger.info("✅ DB Ready")
     except Exception as e:
         logger.error(f"DB Init Error: {e}")
     finally:
@@ -195,10 +190,10 @@ def record_processed_signal(signal_key, target_message_id, tweet_id, source_mess
                 source_message_id = EXCLUDED.source_message_id;
             """, (signal_key, "source", target_message_id, tweet_id, source_message_id))
             conn.commit()
-            logger.info(f"💾 Signal Recorded with ID: {source_message_id}")
+            logger.info(f"💾 Saved ID: {source_message_id}")
             return True
     except Exception as e:
-        logger.error(f"❌ Record Signal Error: {e}")
+        logger.error(f"❌ DB Error: {e}")
         return False
     finally:
         if conn: conn.close()
@@ -211,8 +206,7 @@ def get_daily_tweet_count():
             cur.execute("SELECT tweet_count FROM daily_stats WHERE date = %s", (today,))
             result = cur.fetchone()
             return result[0] if result else 0
-    except Exception as e:
-        return 0
+    except: return 0
     finally:
         if conn: conn.close()
 
@@ -229,8 +223,7 @@ def increment_daily_tweet_count():
             new_count = cur.fetchone()[0]
             conn.commit()
             return new_count
-    except Exception as e:
-        return 0
+    except: return 0
     finally:
         if conn: conn.close()
 
@@ -247,14 +240,16 @@ def get_channels_sync(t):
     return channels
 
 # ----------------------------------------------------------------------
-# 3. VERİ İŞLEME (DÜZELTİLMİŞ KEY MANTIĞI)
+# 3. VERİ İŞLEME (TEMİZLİK + AKILLI BAŞLIK)
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
     data = {}
     
-    # 1. TEMİZLİK: "9 - 0" gibi skorları temizle
-    cleaned_text = re.sub(r'🏟\s*\d+\s*-\s*\d+', '🏟', message_text)
+    # 🔥 1. SERT TEMİZLİK: "9 - 0" vb. satırları yok et 🔥
+    # Stadyum ikonunun yanındaki skorları sil
+    cleaned_text = re.sub(r'🏟\s*[\d\s\-]+', '🏟', message_text)
+    # Satır başında tek başına duran skorları sil (örn: "1 - 2")
     cleaned_text = re.sub(r'^\s*\d+\s*-\s*\d+.*$', '', cleaned_text, flags=re.MULTILINE)
     
     # MAÇ SKORU
@@ -273,15 +268,19 @@ def extract_bet_data(message_text):
     dakika_match = re.search(r'⏰\s*(\d+)\s*', cleaned_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
-    # TAHMİN (Korner Dahil)
+    # TAHMİN (AKILLI TESPİT)
     tahmin_match = re.search(r'❗[️\s]*(.*?)\n', cleaned_text)
     if tahmin_match:
         tahmin_text = tahmin_match.group(1).strip()
+        
+        # Korner mi?
         corner_match = re.search(r'(\d+\.?\d*)\s*(üst|over|alt|under)', tahmin_text, re.IGNORECASE)
         if corner_match:
             data['corner_number'] = corner_match.group(1)
-            data['corner_type'] = corner_match.group(2)
-        
+            data['is_corner'] = True # İşaretle
+        else:
+            data['is_corner'] = False
+            
         tahmin_en = re.search(r'\((.*?)\)', tahmin_text)
         data['tahmin'] = tahmin_en.group(1).strip() if tahmin_en else tahmin_text
     else:
@@ -291,7 +290,7 @@ def extract_bet_data(message_text):
     alert_code_match = re.search(r'👉\s*AlertCode:\s*(\d+)', cleaned_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
     
-    # SONUÇ İKONU
+    # SONUÇ
     result_match = re.search(r'([✅❌])', cleaned_text)
     data['result_icon'] = result_match.group(1) if result_match else None
 
@@ -312,26 +311,17 @@ def extract_bet_data(message_text):
     else:
         data['match_ended'] = False
 
-    # ✅ DÜZELTİLMİŞ SIGNAL KEY OLUŞTURMA
+    # SIGNAL KEY (SABİT)
     if all([data.get('maç_skor'), data.get('tahmin'), data.get('alert_code')]):
-        # Maç adını skordan bağımsız al
         maç_adı = data['maç_skor'].split(' (')[0].strip()
         maç_temiz = re.sub(r'[^A-Za-z\s]', '', maç_adı).strip().replace(' ', '_')
         
-        # TAHMİN TEMİZLİĞİ (Sayıları ve özel karakterleri DOĞRU işle)
         tahmin_raw = data['tahmin']
-        tahmin_temiz = tahmin_raw
-        
-        # Sayıları sil, formatı normalize et
-        tahmin_temiz = re.sub(r'\d+\.?\d*\s*', '', tahmin_temiz) # 8.5, 2.5 sil
-        tahmin_temiz = re.sub(r"BEFORE \d+'", '', tahmin_temiz) # BEFORE 60' sil
-        
-        # Genel temizlik (Noktayı koru, boşlukları _ yap)
+        tahmin_temiz = re.sub(r'\d+\.?\d*\s*', '', tahmin_raw)
         tahmin_temiz = re.sub(r'[^\w\s\.]', '', tahmin_temiz)
         tahmin_temiz = re.sub(r'\s+', '_', tahmin_temiz.strip())
         
         data['signal_key'] = f"{maç_temiz}_{data['alert_code']}_{tahmin_temiz}"
-        logger.info(f"🔑 Stable Key Generated: {data['signal_key']}")
     else:
         data['signal_key'] = None
     
@@ -341,16 +331,25 @@ def build_telegram_message(data):
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
     
-    if data.get('corner_number'):
-        corner_number = data['corner_number']
-        bet_type = f"TOTAL CORNERS {corner_number} OVER"
-        analysis = f"High corner frequency, {corner_number}+ corners expected"
-    else:
+    # 🔥 AKILLI BAŞLIK MANTIĞI 🔥
+    # Eğer metinde "Corner" varsa Başlık KORNER olsun
+    tahmin_lower = data.get('tahmin', '').lower()
+    
+    if data.get('corner_number') or "corner" in tahmin_lower or "korner" in tahmin_lower:
+        main_title = "🎯 LIVE CORNER SIGNAL 🎯"
+        bet_type = f"TOTAL CORNERS {data.get('corner_number', '')} OVER" if data.get('corner_number') else data['tahmin']
+        analysis = "High corner frequency, attack momentum high"
+    elif "goal" in tahmin_lower or "gol" in tahmin_lower or "over" in tahmin_lower:
+        main_title = "🎯 LIVE GOAL SIGNAL 🎯"
         bet_type = template.get('bet_type', data['tahmin'])
         analysis = template.get('analysis', 'Professional betting signal')
-    
+    else:
+        main_title = template.get('title', '🎯 BETTING SIGNAL 🎯')
+        bet_type = template.get('bet_type', data['tahmin'])
+        analysis = template.get('analysis', 'Professional signal')
+
     return f"""
-{template.get('title', '🎯 BETTING SIGNAL 🎯')}
+{main_title}
 
 🏟 {data['maç_skor']}
 🏆 {data['lig']}  
@@ -363,33 +362,23 @@ def build_telegram_message(data):
 ⚡ Time: Bet now!
 """
 
-def build_telegram_live_update(data):
-    return f"""
-🟢 LIVE UPDATE 🟢
-
-🏟 {data['maç_skor']}
-🏆 {data['lig']}  
-⏰ {data['live_minute']}' | 📊 Score: {data['live_score']}
-
-🎯 {data['tahmin']} - IN PROGRESS! 🔄
-
-⚡ Stay tuned for final result!
-"""
-
 def build_x_tweet(data):
+    # Aynı akıllı başlık mantığı burada da geçerli
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
+    tahmin_lower = data.get('tahmin', '').lower()
     
-    if data.get('corner_number'):
-        corner_number = data['corner_number']
-        bet_type = f"TOTAL CORNERS {corner_number} OVER"
-        analysis = f"High corner frequency, {corner_number}+ corners expected"
+    if data.get('corner_number') or "corner" in tahmin_lower:
+        main_title = "🎯 LIVE CORNER SIGNAL 🎯"
+        bet_type = f"TOTAL CORNERS {data.get('corner_number', '')} OVER"
+        analysis = "High corner frequency"
     else:
-        bet_type = template.get('bet_type', data['tahmin'])
+        main_title = "🎯 LIVE GOAL SIGNAL 🎯"
+        bet_type = data['tahmin']
         analysis = template.get('analysis', 'Professional signal')
     
     return f"""
-{template.get('title', '🎯 BETTING SIGNAL 🎯')}
+{main_title}
 
 {data['maç_skor']} | {data['dakika']}'
 {data['lig']}
@@ -400,19 +389,6 @@ def build_x_tweet(data):
 💸 Stake: {template.get('stake', '3/5')}
 
 #Betting #SportsBetting
-"""
-
-def build_x_live_tweet(data):
-    return f"""
-🟢 LIVE UPDATE 🟢
-
-{data['maç_skor']} 
-{data['lig']}
-⏰ {data['live_minute']}' | 📊 {data['live_score']}
-
-🎯 {data['tahmin']} - IN PROGRESS! 🔄
-
-#LiveBetting #Sports
 """
 
 def build_x_reply_tweet(data):
@@ -447,14 +423,14 @@ def post_to_x_sync(tweet_text, reply_to_id=None):
             return response.data['id']
         except Exception as e:
             if "429" in str(e): return None
-            logger.warning(f"⚠️ X Post Retry ({attempt+1}/{max_retries}): {e}")
+            logger.warning(f"⚠️ X Post Retry: {e}")
     return None
 
 async def post_to_x_async(text, reply_id=None):
     return await asyncio.to_thread(post_to_x_sync, text, reply_id)
 
 # ----------------------------------------------------------------------
-# 4. HANDLER (YEDEK EŞLEŞTİRME VE ID KONTROLÜ)
+# 4. HANDLER (SADECE EDİTLEME MANTIĞI)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -469,58 +445,34 @@ async def scheduled_post_task():
                 except: pass
         await asyncio.sleep(interval)
 
-async def process_match_result(data, signal_record):
+async def update_existing_message(data, signal_record):
+    """
+    🔥 TEK FONKSİYON, TÜM GÜNCELLEMELER İÇİN 🔥
+    İster gol olsun, ister dakika değişsin, ister maç bitsin:
+    Eski mesajı bulur ve içeriğini GÜNCELLER. Yeni mesaj atmaz.
+    """
     target_message_id = signal_record.get('target_message_id')
     tweet_id = signal_record.get('tweet_id')
     
+    # 1. TELEGRAM: Sadece Düzenle (Edit)
     targets = get_channels_sync('target')
     for t in targets:
         try:
             await bot_client.edit_message(
                 t['channel_id'], 
                 target_message_id, 
-                text=build_telegram_message(data),
+                text=build_telegram_message(data), # Yeni skorlu metin
                 buttons=BETTING_BUTTONS
             )
-            logger.info(f"✅ Telegram UPDATED (Result)")
+            logger.info(f"✏️ Telegram Updated: {data['live_score'] if data.get('is_live_update') else 'Info'}")
         except Exception as e: 
             logger.error(f"❌ Telegram Edit error: {e}")
     
-    x_reply = build_x_reply_tweet(data)
-    if x_reply and tweet_id:
-        await post_to_x_async(x_reply, tweet_id)
-
-async def process_live_update(data, signal_record):
-    target_message_id = signal_record.get('target_message_id')
-    tweet_id = signal_record.get('tweet_id')
-    
-    targets = get_channels_sync('target')
-    for t in targets:
-        try:
-            await bot_client.send_message(
-                t['channel_id'], 
-                build_telegram_live_update(data), 
-                buttons=BETTING_BUTTONS, 
-                reply_to=target_message_id
-            )
-        except: pass
-    
-    if tweet_id:
-        await post_to_x_async(build_x_live_tweet(data), tweet_id)
-
-async def process_general_update(data, signal_record):
-    target_message_id = signal_record.get('target_message_id')
-    targets = get_channels_sync('target')
-    for t in targets:
-        try:
-            await bot_client.edit_message(
-                t['channel_id'], 
-                target_message_id, 
-                text=build_telegram_message(data),
-                buttons=BETTING_BUTTONS
-            )
-            logger.info(f"✏️ Telegram UPDATED (General)")
-        except: pass
+    # 2. X (Twitter): Sadece Maç Bitince Yanıt At
+    if (data.get('match_ended') or data.get('result_icon')) and tweet_id:
+        x_reply = build_x_reply_tweet(data)
+        if x_reply:
+            await post_to_x_async(x_reply, tweet_id)
 
 async def channel_handler(event):
     if not bot_running: return
@@ -532,39 +484,14 @@ async def channel_handler(event):
     if not data or not data['signal_key']: return
     if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
 
-    # 1. ÖNCE ID İLE ARA
+    # ID İLE ARA
     signal_record = await asyncio.to_thread(get_signal_by_source_id, source_msg_id)
     
-    # 2. BULAMAZSAN, SIGNAL KEY İLE YEDEK ARA (FALLBACK)
-    if not signal_record:
-        conn = get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM processed_signals WHERE signal_key = %s", (data['signal_key'],))
-                found = cur.fetchone()
-                if found:
-                    signal_record = dict(found)
-                    logger.info(f"🔄 YEDEK EŞLEŞTİRME BAŞARILI: {data['signal_key']}")
-                    # Kaydı güncelle, yeni source_id'yi ekle
-                    await asyncio.to_thread(record_processed_signal, 
-                                          data['signal_key'], 
-                                          signal_record['target_message_id'], 
-                                          signal_record['tweet_id'], 
-                                          source_msg_id)
-        except: pass
-        finally:
-            if conn: conn.close()
-
     # --- DURUM A: ZATEN VAR (GÜNCELLEME) ---
     if signal_record:
-        logger.info(f"🔄 GÜNCELLEME ALGILANDI (ID: {source_msg_id})")
-        
-        if data.get('match_ended') or data.get('result_icon'):
-            await process_match_result(data, signal_record)
-        elif data.get('is_live_update'):
-            await process_live_update(data, signal_record)
-        else:
-            await process_general_update(data, signal_record)
+        logger.info(f"🔄 GÜNCELLEME GELDİ (ID: {source_msg_id})")
+        # Tek fonksiyonla hallediyoruz: Mesajı düzenle
+        await update_existing_message(data, signal_record)
 
     # --- DURUM B: YOK (YENİ SİNYAL) ---
     else:
@@ -597,7 +524,7 @@ async def channel_handler(event):
             await asyncio.to_thread(record_processed_signal, data['signal_key'], target_message_id, tweet_id, source_msg_id)
 
 # ----------------------------------------------------------------------
-# 5. FLASK & ANA ÇALIŞTIRMA
+# 5. WEB SUNUCUSU
 # ----------------------------------------------------------------------
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -638,7 +565,7 @@ async def main():
         user_client.add_event_handler(channel_handler, events.NewMessage(incoming=True, chats=source_ids))
         user_client.add_event_handler(channel_handler, events.MessageEdited(chats=source_ids))
         
-        logger.info(f"📡 Listening on channels (NEW + EDITED): {source_ids}")
+        logger.info(f"📡 Bot Hazır (Kaynak ID: {source_ids})")
         
         asyncio.create_task(scheduled_post_task())
         await user_client.run_until_disconnected()
