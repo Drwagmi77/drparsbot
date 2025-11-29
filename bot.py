@@ -134,8 +134,7 @@ def init_db_sync():
                 source_channel TEXT NOT NULL,
                 target_message_id BIGINT,
                 tweet_id BIGINT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'PENDING'
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         
@@ -179,8 +178,8 @@ def record_processed_signal(signal_key, target_message_id, tweet_id):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO processed_signals (signal_key, source_channel, target_message_id, tweet_id, status) 
-                VALUES (%s, %s, %s, %s, 'PENDING') 
+                INSERT INTO processed_signals (signal_key, source_channel, target_message_id, tweet_id) 
+                VALUES (%s, %s, %s, %s) 
                 ON CONFLICT (signal_key) DO UPDATE SET 
                 target_message_id = EXCLUDED.target_message_id, 
                 tweet_id = EXCLUDED.tweet_id;
@@ -248,12 +247,13 @@ def get_channels_sync(t):
     return channels
 
 # ----------------------------------------------------------------------
-# 3. VERİ İŞLEME VE FORMATLAMA
+# 3. VERİ İŞLEME VE FORMATLAMA (GÜNCELLENDİ)
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
     data = {}
     
+    # MAÇ SKORU
     match_score_match = re.search(r'⚽[️\s]*(.*?)\s*\(.*?\)', message_text, re.DOTALL)
     if match_score_match:
         data['maç_skor'] = match_score_match.group(0).strip().replace('⚽', '').replace('️', '').strip()
@@ -261,36 +261,49 @@ def extract_bet_data(message_text):
         match_alt = re.search(r'([A-Za-z\s]+-\s*[A-Za-z\s]+)\s*\(\s*(\d+\s*-\s*\d+)\s*\)', message_text)
         data['maç_skor'] = f"{match_alt.group(1)} ({match_alt.group(2)})" if match_alt else None
     
+    # LİG
     lig_match = re.search(r'🏟\s*(.*?)\n', message_text)
     data['lig'] = lig_match.group(1).strip() if lig_match else None
     
+    # DAKİKA
     dakika_match = re.search(r'⏰\s*(\d+)\s*', message_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
+    # TAHMİN - YENİ KORNER DESTEĞİ
     tahmin_match = re.search(r'❗[️\s]*(.*?)\n', message_text)
     if tahmin_match:
         tahmin_text = tahmin_match.group(1).strip()
+        
+        # KORNER SAYISINI ÇIKAR
+        corner_match = re.search(r'(\d+\.?\d*)\s*(üst|over|alt|under)', tahmin_text, re.IGNORECASE)
+        if corner_match:
+            data['corner_number'] = corner_match.group(1)
+            data['corner_type'] = corner_match.group(2)
+            logger.info(f"🎯 Korner sayısı bulundu: {data['corner_number']} {data['corner_type']}")
+        
+        # İngilizce kısmı al
         tahmin_en = re.search(r'\((.*?)\)', tahmin_text)
         data['tahmin'] = tahmin_en.group(1).strip() if tahmin_en else tahmin_text
     else:
         data['tahmin'] = None
     
+    # ALERT CODE
     alert_code_match = re.search(r'👉\s*AlertCode:\s*(\d+)', message_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
     
+    # SONUÇ İKONU
     result_match = re.search(r'([✅❌])', message_text)
     data['result_icon'] = result_match.group(1) if result_match else None
 
+    # LIVE UPDATE
     live_score_match = re.search(r'⏰\s*(\d+)\s*⚽[️\s]*(\d+\s*-\s*\d+)', message_text)
     if live_score_match:
         data['live_minute'] = live_score_match.group(1).strip()
         data['live_score'] = live_score_match.group(2).strip()
         data['is_live_update'] = True
+        logger.info(f"🔄 Live update algılandı: {data['live_score']} @ {data['live_minute']}")
     else:
         data['is_live_update'] = False
-
-    final_score_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', message_text)
-    data['final_score'] = final_score_match.group(1).strip() if final_score_match else None
 
     # MAÇ BİTTİ Mİ? (#⃣ FT kontrolü)
     ft_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', message_text)
@@ -301,6 +314,7 @@ def extract_bet_data(message_text):
     else:
         data['match_ended'] = False
 
+    # SIGNAL KEY OLUŞTUR
     if all([data.get('maç_skor'), data.get('tahmin')]):
         maç_temiz = re.sub(r'[\(\)]', '', data['maç_skor']).strip().replace(' ', '_').replace('-', '')
         tahmin_temiz = re.sub(r'[^\w\s]', '', data['tahmin']).strip().replace(' ', '_')
@@ -319,6 +333,7 @@ def find_original_signal_key(current_data):
     tahmin_temiz = re.sub(r'[^\w\s]', '', current_data['tahmin']).strip().replace(' ', '_')
     for key in all_keys:
         if maç_temiz in key and tahmin_temiz in key:
+            logger.info(f"🔍 Orijinal sinyal bulundu: {key}")
             return key
     return None
 
@@ -327,17 +342,13 @@ def build_telegram_message(data):
     template = ALERT_TEMPLATES.get(alert_code, {})
     
     # KORNER BAHİSLERİ İÇİN ÖZEL FORMAT
-    tahmin = data['tahmin']
-    if "corner" in tahmin.lower() or "korner" in tahmin.lower():
-        # Orijinal mesajdan korner sayısını al
-        corner_match = re.search(r'(\d+\.?\d*)\s*(üst|over|alt|under)', data['tahmin'], re.IGNORECASE)
-        if corner_match:
-            corner_number = corner_match.group(1)
-            bet_type = f"TOTAL CORNERS {corner_number} OVER"
-        else:
-            bet_type = template.get('bet_type', data['tahmin'])
+    if data.get('corner_number'):
+        corner_number = data['corner_number']
+        bet_type = f"TOTAL CORNERS {corner_number} OVER"
+        analysis = f"High corner frequency, {corner_number}+ corners expected"
     else:
         bet_type = template.get('bet_type', data['tahmin'])
+        analysis = template.get('analysis', 'Professional betting signal')
     
     return f"""
 {template.get('title', '🎯 BETTING SIGNAL 🎯')}
@@ -348,7 +359,7 @@ def build_telegram_message(data):
 
 🎯 {bet_type}
 
-📈 Analysis: {template.get('analysis', 'Professional betting signal')}
+📈 Analysis: {analysis}
 💸 Stake: {template.get('stake', '3/5')}
 ⚡ Time: Bet now!
 """
@@ -371,16 +382,13 @@ def build_x_tweet(data):
     template = ALERT_TEMPLATES.get(alert_code, {})
     
     # KORNER BAHİSLERİ İÇİN ÖZEL FORMAT
-    tahmin = data['tahmin']
-    if "corner" in tahmin.lower() or "korner" in tahmin.lower():
-        corner_match = re.search(r'(\d+\.?\d*)\s*(üst|over|alt|under)', data['tahmin'], re.IGNORECASE)
-        if corner_match:
-            corner_number = corner_match.group(1)
-            bet_type = f"TOTAL CORNERS {corner_number} OVER"
-        else:
-            bet_type = template.get('bet_type', data['tahmin'])
+    if data.get('corner_number'):
+        corner_number = data['corner_number']
+        bet_type = f"TOTAL CORNERS {corner_number} OVER"
+        analysis = f"High corner frequency, {corner_number}+ corners expected"
     else:
         bet_type = template.get('bet_type', data['tahmin'])
+        analysis = template.get('analysis', 'Professional signal')
     
     return f"""
 {template.get('title', '🎯 BETTING SIGNAL 🎯')}
@@ -390,7 +398,7 @@ def build_x_tweet(data):
 
 🎯 {bet_type}
 
-📈 {template.get('analysis', 'Professional signal')}
+📈 {analysis}
 💸 Stake: {template.get('stake', '3/5')}
 
 #Betting #SportsBetting
@@ -427,11 +435,18 @@ FT: {data.get('final_score', 'Finished')}
 """
 
 def post_to_x_sync(tweet_text, reply_to_id=None):
-    """X'e tweet atar (Retry Mekanizmalı - 3 Deneme)."""
-    max_retries = 3
+    """X'e tweet atar (Rate Limit Korumalı)."""
+    max_retries = 2
     for attempt in range(max_retries):
         try:
             if not x_client: return None
+            
+            # Rate limit kontrolü
+            if attempt > 0:
+                wait_time = 10 * attempt
+                logger.info(f"⏳ Rate limit wait: {wait_time}s")
+                time.sleep(wait_time)
+                
             if reply_to_id:
                 response = x_client.create_tweet(text=tweet_text, in_reply_to_tweet_id=reply_to_id)
             else:
@@ -439,15 +454,18 @@ def post_to_x_sync(tweet_text, reply_to_id=None):
             logger.info(f"✅ X Tweet Sent: {response.data['id']}")
             return response.data['id']
         except Exception as e:
+            if "429" in str(e):
+                logger.warning("🚫 X Rate Limit - Skipping tweet")
+                return None
             logger.warning(f"⚠️ X Post Retry ({attempt+1}/{max_retries}): {e}")
-            if attempt < max_retries - 1: time.sleep(2)
+            if attempt < max_retries - 1: time.sleep(5)
     return None
 
 async def post_to_x_async(text, reply_id=None):
     return await asyncio.to_thread(post_to_x_sync, text, reply_id)
 
 # ----------------------------------------------------------------------
-# 4. HANDLER (MESAJ DÜZENLEME DESTEKLİ)
+# 4. HANDLER (GÜNCELLEME DESTEKLİ)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -474,7 +492,7 @@ async def process_match_result(data, signal_record):
             await bot_client.edit_message(
                 t['channel_id'], 
                 target_message_id, 
-                text=build_telegram_message(data),  # Güncellenmiş mesaj
+                text=build_telegram_message(data),
                 buttons=BETTING_BUTTONS
             )
             logger.info(f"✅ Telegram message UPDATED for result: {data['signal_key']}")
@@ -487,8 +505,32 @@ async def process_match_result(data, signal_record):
         await post_to_x_async(x_reply, tweet_id)
         logger.info(f"✅ X result posted for: {data['signal_key']}")
 
+async def process_live_update(data, signal_record):
+    """Live update işle"""
+    target_message_id = signal_record.get('target_message_id')
+    tweet_id = signal_record.get('tweet_id')
+    
+    targets = get_channels_sync('target')
+    for t in targets:
+        try:
+            await bot_client.send_message(
+                t['channel_id'], 
+                build_telegram_live_update(data), 
+                buttons=BETTING_BUTTONS, 
+                reply_to=target_message_id
+            )
+            logger.info(f"🔄 Live update sent: {data['live_score']}")
+        except: pass
+    
+    if tweet_id:
+        await post_to_x_async(build_x_live_tweet(data), tweet_id)
+
 async def channel_handler(event):
     if not bot_running: return
+    
+    # MESAJ TİPİNİ KONTROL ET
+    is_edited = isinstance(event, events.MessageEdited)
+    message_type = "EDITED" if is_edited else "NEW"
     
     message_text = event.raw_text.strip()
     data = await asyncio.to_thread(extract_bet_data, message_text)
@@ -496,7 +538,7 @@ async def channel_handler(event):
     if not data or not data['signal_key']: return
     if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
 
-    logger.info(f"📨 Processing message: {data['signal_key']}")
+    logger.info(f"📨 Processing {message_type} message: {data['signal_key']}")
 
     # ÖNCEDEN İŞLENMİŞ Mİ?
     signal_record = await asyncio.to_thread(get_signal_data, data['signal_key'])
@@ -510,25 +552,12 @@ async def channel_handler(event):
         
         # CANLI GÜNCELLEME Mİ?
         elif data.get('is_live_update'):
-            original_key = await asyncio.to_thread(find_original_signal_key, data)
-            if original_key:
-                signal_record = await asyncio.to_thread(get_signal_data, original_key)
-                if signal_record:
-                    target_message_id = signal_record.get('target_message_id')
-                    tweet_id = signal_record.get('tweet_id')
-                    
-                    targets = get_channels_sync('target')
-                    for t in targets:
-                        try:
-                            await bot_client.send_message(t['channel_id'], build_telegram_live_update(data), buttons=BETTING_BUTTONS, reply_to=target_message_id)
-                        except: pass
-                    
-                    if tweet_id:
-                        await post_to_x_async(build_x_live_tweet(data), tweet_id)
+            await process_live_update(data, signal_record)
         
         # DİĞER GÜNCELLEMELER (skor değişikliği vb.)
         else:
-            logger.info(f"🔄 Processing update for: {data['signal_key']}")
+            logger.info(f"🔄 Processing general update for: {data['signal_key']}")
+            # Burada genel güncellemeleri işleyebiliriz
     
     else:
         # ✅ BU YENİ BİR SİNYAL!
@@ -539,23 +568,20 @@ async def channel_handler(event):
         tweet_id = None
         
         if current_count < DAILY_TWEET_LIMIT:
-            # Limit dolmadı, tweet at
             try:
                 tweet_id = await post_to_x_async(build_x_tweet(data))
                 if tweet_id:
                     new_count = await asyncio.to_thread(increment_daily_tweet_count)
                     logger.info(f"📊 Daily Tweet Count: {new_count}/{DAILY_TWEET_LIMIT}")
                     
-                    # Eğer tam 15 olduysa KAPANIŞ MESAJINI at
                     if new_count == DAILY_TWEET_LIMIT:
                         logger.info("🚫 Limit Reached. Sending Closing Tweet...")
                         await post_to_x_async(CLOSING_TWEET_TEXT)
             except: pass
         else:
             logger.info("🚫 Daily X Limit reached. Skipping tweet.")
-        # -------------------------------------
 
-        # Telegram Mesajı (Hep atar)
+        # Telegram Mesajı
         target_message_id = None
         targets = get_channels_sync('target')
         for t in targets:
@@ -565,7 +591,7 @@ async def channel_handler(event):
             except Exception as e: 
                 logger.error(f"Telegram Send error: {e}")
         
-        # Veritabanına Kaydet (X atılamasa bile!)
+        # Veritabanına Kaydet
         if target_message_id:
             await asyncio.to_thread(record_processed_signal, data['signal_key'], target_message_id, tweet_id)
 
@@ -608,7 +634,7 @@ async def main():
         await user_client.connect()
         source_ids = [c['channel_id'] for c in get_channels_sync('source')]
         
-        # ⭐ YENİ MESAJLARI ve DÜZENLENMİŞ MESAJLARI dinle! ⭐
+        # YENİ MESAJLARI ve DÜZENLENMİŞ MESAJLARI dinle
         user_client.add_event_handler(channel_handler, events.NewMessage(incoming=True, chats=source_ids))
         user_client.add_event_handler(channel_handler, events.MessageEdited(chats=source_ids))
         
