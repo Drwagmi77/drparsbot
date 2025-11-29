@@ -14,7 +14,7 @@ from hypercorn.config import Config
 from asgiref.wsgi import WsgiToAsgi
 
 # ----------------------------------------------------------------------
-# 1. ORTAM DEĞİŞKENLERİ
+# 1. ORTAM DEĞİŞKENLERİ VE YAPILANDIRMA
 # ----------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -40,7 +40,7 @@ try:
 except Exception as e:
     logger.critical(f"Missing environment variables: {e}")
 
-# --- AYARLAR ---
+# --- GLOBAL AYARLAR ---
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
 DAILY_TWEET_LIMIT = 15
 
@@ -75,7 +75,10 @@ BETTING_BUTTONS = [
     ]
 ]
 
-# (Şablonlar duruyor ama artık Akıllı Başlık kullanacağız)
+# EKSİK OLAN HTML FORMLARI EKLENDİ 👇
+LOGIN_FORM = """<!doctype html><title>Login</title><h2>Phone</h2><form method=post><input name=phone placeholder="+90..." required><button>Send Code</button></form>"""
+CODE_FORM = """<!doctype html><title>Code</title><h2>Enter Code</h2><form method=post><input name=code placeholder=12345 required><button>Login</button></form>"""
+
 ALERT_TEMPLATES = {
     '1': {'bet_type': "NEXT GOAL AFTER 65' (+0.5)", 'stake': "4/5", 'analysis': "High scoring pattern"},
     '17': {'bet_type': "TOTAL GOALS 2.5 OVER BEFORE 60'", 'stake': "4/5", 'analysis': "Fast paced game"},
@@ -240,16 +243,14 @@ def get_channels_sync(t):
     return channels
 
 # ----------------------------------------------------------------------
-# 3. VERİ İŞLEME (TEMİZLİK + AKILLI BAŞLIK)
+# 3. VERİ İŞLEME
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
     data = {}
     
-    # 🔥 1. SERT TEMİZLİK: "9 - 0" vb. satırları yok et 🔥
-    # Stadyum ikonunun yanındaki skorları sil
+    # TEMİZLİK
     cleaned_text = re.sub(r'🏟\s*[\d\s\-]+', '🏟', message_text)
-    # Satır başında tek başına duran skorları sil (örn: "1 - 2")
     cleaned_text = re.sub(r'^\s*\d+\s*-\s*\d+.*$', '', cleaned_text, flags=re.MULTILINE)
     
     # MAÇ SKORU
@@ -268,16 +269,14 @@ def extract_bet_data(message_text):
     dakika_match = re.search(r'⏰\s*(\d+)\s*', cleaned_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
-    # TAHMİN (AKILLI TESPİT)
+    # TAHMİN
     tahmin_match = re.search(r'❗[️\s]*(.*?)\n', cleaned_text)
     if tahmin_match:
         tahmin_text = tahmin_match.group(1).strip()
-        
-        # Korner mi?
         corner_match = re.search(r'(\d+\.?\d*)\s*(üst|over|alt|under)', tahmin_text, re.IGNORECASE)
         if corner_match:
             data['corner_number'] = corner_match.group(1)
-            data['is_corner'] = True # İşaretle
+            data['is_corner'] = True
         else:
             data['is_corner'] = False
             
@@ -311,7 +310,7 @@ def extract_bet_data(message_text):
     else:
         data['match_ended'] = False
 
-    # SIGNAL KEY (SABİT)
+    # SIGNAL KEY
     if all([data.get('maç_skor'), data.get('tahmin'), data.get('alert_code')]):
         maç_adı = data['maç_skor'].split(' (')[0].strip()
         maç_temiz = re.sub(r'[^A-Za-z\s]', '', maç_adı).strip().replace(' ', '_')
@@ -331,8 +330,6 @@ def build_telegram_message(data):
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
     
-    # 🔥 AKILLI BAŞLIK MANTIĞI 🔥
-    # Eğer metinde "Corner" varsa Başlık KORNER olsun
     tahmin_lower = data.get('tahmin', '').lower()
     
     if data.get('corner_number') or "corner" in tahmin_lower or "korner" in tahmin_lower:
@@ -363,7 +360,6 @@ def build_telegram_message(data):
 """
 
 def build_x_tweet(data):
-    # Aynı akıllı başlık mantığı burada da geçerli
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
     tahmin_lower = data.get('tahmin', '').lower()
@@ -447,24 +443,22 @@ async def scheduled_post_task():
 
 async def update_existing_message(data, signal_record):
     """
-    🔥 TEK FONKSİYON, TÜM GÜNCELLEMELER İÇİN 🔥
-    İster gol olsun, ister dakika değişsin, ister maç bitsin:
-    Eski mesajı bulur ve içeriğini GÜNCELLER. Yeni mesaj atmaz.
+    🔥 TEK FONKSİYON: Sadece GÜNCELLEME (Edit) 🔥
     """
     target_message_id = signal_record.get('target_message_id')
     tweet_id = signal_record.get('tweet_id')
     
-    # 1. TELEGRAM: Sadece Düzenle (Edit)
+    # 1. TELEGRAM: Sadece Düzenle
     targets = get_channels_sync('target')
     for t in targets:
         try:
             await bot_client.edit_message(
                 t['channel_id'], 
                 target_message_id, 
-                text=build_telegram_message(data), # Yeni skorlu metin
+                text=build_telegram_message(data),
                 buttons=BETTING_BUTTONS
             )
-            logger.info(f"✏️ Telegram Updated: {data['live_score'] if data.get('is_live_update') else 'Info'}")
+            logger.info(f"✏️ Telegram Updated")
         except Exception as e: 
             logger.error(f"❌ Telegram Edit error: {e}")
     
@@ -490,7 +484,6 @@ async def channel_handler(event):
     # --- DURUM A: ZATEN VAR (GÜNCELLEME) ---
     if signal_record:
         logger.info(f"🔄 GÜNCELLEME GELDİ (ID: {source_msg_id})")
-        # Tek fonksiyonla hallediyoruz: Mesajı düzenle
         await update_existing_message(data, signal_record)
 
     # --- DURUM B: YOK (YENİ SİNYAL) ---
@@ -524,7 +517,7 @@ async def channel_handler(event):
             await asyncio.to_thread(record_processed_signal, data['signal_key'], target_message_id, tweet_id, source_msg_id)
 
 # ----------------------------------------------------------------------
-# 5. WEB SUNUCUSU
+# 5. FLASK & ANA ÇALIŞTIRMA
 # ----------------------------------------------------------------------
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -565,7 +558,7 @@ async def main():
         user_client.add_event_handler(channel_handler, events.NewMessage(incoming=True, chats=source_ids))
         user_client.add_event_handler(channel_handler, events.MessageEdited(chats=source_ids))
         
-        logger.info(f"📡 Bot Hazır (Kaynak ID: {source_ids})")
+        logger.info(f"📡 Listening on channels (NEW + EDITED): {source_ids}")
         
         asyncio.create_task(scheduled_post_task())
         await user_client.run_until_disconnected()
