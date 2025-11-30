@@ -14,7 +14,7 @@ from hypercorn.config import Config
 from asgiref.wsgi import WsgiToAsgi
 
 # ----------------------------------------------------------------------
-# 1. ORTAM DEĞİŞKENLERİ VE YAPILANDIRMA
+# 1. ENVIRONMENT VARIABLES
 # ----------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -40,7 +40,7 @@ try:
 except Exception as e:
     logger.critical(f"Missing environment variables: {e}")
 
-# --- GLOBAL AYARLAR ---
+# --- GLOBAL SETTINGS ---
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
 DAILY_TWEET_LIMIT = 15
 
@@ -75,10 +75,7 @@ BETTING_BUTTONS = [
     ]
 ]
 
-# EKSİK OLAN HTML FORMLARI EKLENDİ 👇
-LOGIN_FORM = """<!doctype html><title>Login</title><h2>Phone</h2><form method=post><input name=phone placeholder="+90..." required><button>Send Code</button></form>"""
-CODE_FORM = """<!doctype html><title>Code</title><h2>Enter Code</h2><form method=post><input name=code placeholder=12345 required><button>Login</button></form>"""
-
+# TEMPLATES
 ALERT_TEMPLATES = {
     '1': {'bet_type': "NEXT GOAL AFTER 65' (+0.5)", 'stake': "4/5", 'analysis': "High scoring pattern"},
     '17': {'bet_type': "TOTAL GOALS 2.5 OVER BEFORE 60'", 'stake': "4/5", 'analysis': "Fast paced game"},
@@ -111,8 +108,11 @@ except Exception as e:
 
 bot_running = True 
 
+LOGIN_FORM = """<!doctype html><title>Login</title><h2>Phone</h2><form method=post><input name=phone placeholder="+90..." required><button>Send Code</button></form>"""
+CODE_FORM = """<!doctype html><title>Code</title><h2>Enter Code</h2><form method=post><input name=code placeholder=12345 required><button>Login</button></form>"""
+
 # ----------------------------------------------------------------------
-# 2. VERİTABANI
+# 2. DATABASE MANAGEMENT
 # ----------------------------------------------------------------------
 
 def get_connection():
@@ -243,17 +243,24 @@ def get_channels_sync(t):
     return channels
 
 # ----------------------------------------------------------------------
-# 3. VERİ İŞLEME
+# 3. DATA EXTRACTION
 # ----------------------------------------------------------------------
 
 def extract_bet_data(message_text):
     data = {}
     
-    # TEMİZLİK
+    # 1. CLEANING
     cleaned_text = re.sub(r'🏟\s*[\d\s\-]+', '🏟', message_text)
     cleaned_text = re.sub(r'^\s*\d+\s*-\s*\d+.*$', '', cleaned_text, flags=re.MULTILINE)
     
-    # MAÇ SKORU
+    # HEADER SCORE (For Updates)
+    header_score_match = re.search(r'🏟\s*(\d+\s*-\s*\d+)', message_text)
+    if not header_score_match:
+        header_score_match = re.search(r'^\s*(\d+\s*-\s*\d+)', message_text, re.MULTILINE)
+    
+    data['header_score'] = header_score_match.group(1).strip() if header_score_match else None
+
+    # MATCH SCORE (Teams & Entry Score in parens)
     match_score_match = re.search(r'⚽[️\s]*(.*?)\s*\(.*?\)', cleaned_text, re.DOTALL)
     if match_score_match:
         data['maç_skor'] = match_score_match.group(0).strip().replace('⚽', '').replace('️', '').strip()
@@ -261,15 +268,23 @@ def extract_bet_data(message_text):
         match_alt = re.search(r'([A-Za-z\s]+-\s*[A-Za-z\s]+)\s*\(\s*(\d+\s*-\s*\d+)\s*\)', cleaned_text)
         data['maç_skor'] = f"{match_alt.group(1)} ({match_alt.group(2)})" if match_alt else None
     
-    # LİG
-    lig_match = re.search(r'🏟\s*(.*?)\n', cleaned_text)
-    data['lig'] = lig_match.group(1).strip() if lig_match else None
+    # LEAGUE
+    lig_match = re.search(r'🏆\s*(.*?)\n', cleaned_text)
+    if lig_match:
+        data['lig'] = lig_match.group(1).strip()
+    else:
+        lig_alt = re.search(r'🏟\s*(.*?)\n', cleaned_text)
+        text_yan = lig_alt.group(1).strip() if lig_alt else ""
+        if text_yan and not re.match(r'^\d+\s*-\s*\d+$', text_yan):
+            data['lig'] = text_yan
+        else:
+            data['lig'] = "League Info"
     
-    # DAKİKA
+    # MINUTE
     dakika_match = re.search(r'⏰\s*(\d+)\s*', cleaned_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
-    # TAHMİN
+    # PREDICTION
     tahmin_match = re.search(r'❗[️\s]*(.*?)\n', cleaned_text)
     if tahmin_match:
         tahmin_text = tahmin_match.group(1).strip()
@@ -279,7 +294,6 @@ def extract_bet_data(message_text):
             data['is_corner'] = True
         else:
             data['is_corner'] = False
-            
         tahmin_en = re.search(r'\((.*?)\)', tahmin_text)
         data['tahmin'] = tahmin_en.group(1).strip() if tahmin_en else tahmin_text
     else:
@@ -289,20 +303,18 @@ def extract_bet_data(message_text):
     alert_code_match = re.search(r'👉\s*AlertCode:\s*(\d+)', cleaned_text)
     data['alert_code'] = alert_code_match.group(1).strip() if alert_code_match else None
     
-    # SONUÇ
+    # RESULT
     result_match = re.search(r'([✅❌])', cleaned_text)
     data['result_icon'] = result_match.group(1) if result_match else None
 
     # LIVE UPDATE
     live_score_match = re.search(r'⏰\s*(\d+)\s*⚽[️\s]*(\d+\s*-\s*\d+)', cleaned_text)
     if live_score_match:
-        data['live_minute'] = live_score_match.group(1).strip()
-        data['live_score'] = live_score_match.group(2).strip()
         data['is_live_update'] = True
     else:
         data['is_live_update'] = False
 
-    # MAÇ BİTTİ Mİ?
+    # MATCH ENDED
     ft_match = re.search(r'#⃣\s*FT\s*(\d+\s*-\s*\d+)', cleaned_text)
     if ft_match:
         data['match_ended'] = True
@@ -312,14 +324,12 @@ def extract_bet_data(message_text):
 
     # SIGNAL KEY
     if all([data.get('maç_skor'), data.get('tahmin'), data.get('alert_code')]):
-        maç_adı = data['maç_skor'].split(' (')[0].strip()
-        maç_temiz = re.sub(r'[^A-Za-z\s]', '', maç_adı).strip().replace(' ', '_')
-        
+        maç_adi = data['maç_skor'].split(' (')[0].strip()
+        maç_temiz = re.sub(r'[^A-Za-z\s]', '', maç_adi).strip().replace(' ', '_')
         tahmin_raw = data['tahmin']
         tahmin_temiz = re.sub(r'\d+\.?\d*\s*', '', tahmin_raw)
         tahmin_temiz = re.sub(r'[^\w\s\.]', '', tahmin_temiz)
         tahmin_temiz = re.sub(r'\s+', '_', tahmin_temiz.strip())
-        
         data['signal_key'] = f"{maç_temiz}_{data['alert_code']}_{tahmin_temiz}"
     else:
         data['signal_key'] = None
@@ -329,60 +339,94 @@ def extract_bet_data(message_text):
 def build_telegram_message(data):
     alert_code = data.get('alert_code')
     template = ALERT_TEMPLATES.get(alert_code, {})
-    
     tahmin_lower = data.get('tahmin', '').lower()
     
-    if data.get('corner_number') or "corner" in tahmin_lower or "korner" in tahmin_lower:
-        main_title = "🎯 LIVE CORNER SIGNAL 🎯"
-        bet_type = f"TOTAL CORNERS {data.get('corner_number', '')} OVER" if data.get('corner_number') else data['tahmin']
-        analysis = "High corner frequency, attack momentum high"
-    elif "goal" in tahmin_lower or "gol" in tahmin_lower or "over" in tahmin_lower:
-        main_title = "🎯 LIVE GOAL SIGNAL 🎯"
-        bet_type = template.get('bet_type', data['tahmin'])
-        analysis = template.get('analysis', 'Professional betting signal')
+    # 1. STATE & HEADER CONFIG
+    if data.get('match_ended') or data.get('result_icon') == '✅':
+        state = "WON"
+    elif data.get('result_icon') == '❌':
+        state = "LOST"
+    elif data.get('header_score'): # Gol oldu (Güncelleme)
+        state = "UPDATE"
     else:
-        main_title = template.get('title', '🎯 BETTING SIGNAL 🎯')
-        bet_type = template.get('bet_type', data['tahmin'])
-        analysis = template.get('analysis', 'Professional signal')
+        state = "NEW"
 
+    # --- CONTENT BUILDER ---
+    
+    # A) BAŞLIK VE SKOR ALANI
+    if state == "WON":
+        main_title = "✅✅ BET WON! ✅✅"
+        # Bitiş skoru
+        final_sc = data.get('final_score', data.get('header_score', 'Finished'))
+        top_info_line = f"🏁 Full Time: {final_sc}"
+        footer_status = "💵 Result: WON (PROFIT)"
+    
+    elif state == "LOST":
+        main_title = "❌ BET LOST"
+        top_info_line = f"🏁 Full Time: {data.get('final_score', 'Finished')}"
+        footer_status = "💵 Result: LOST"
+
+    elif state == "UPDATE":
+        # Gol güncellemesi: Başlıkta golü ve yeni skoru göster
+        main_title = f"⚽ GOAL UPDATE! ({data.get('dakika', '')}') Score: {data['header_score']}"
+        # Alt satırda ise GİRİŞ SKORUNU (Original Entry) göster ki karışmasın
+        entry_score = data['maç_skor'].split('(')[-1].replace(')', '') if '(' in data['maç_skor'] else '0-0'
+        top_info_line = f"⏰ {data.get('dakika')}' │ 📊 Entry Score: {entry_score}"
+        footer_status = "Status: Bet Pending... (Match Active)"
+
+    else: # NEW
+        # Başlık tipini belirle
+        if data.get('corner_number') or "corner" in tahmin_lower or "korner" in tahmin_lower:
+            main_title = "🎯 LIVE CORNER SIGNAL 🎯"
+        else:
+            main_title = template.get('title', "🎯 LIVE BETTING SIGNAL")
+        
+        # İlk sinyalde skor
+        entry_score = data['maç_skor'].split('(')[-1].replace(')', '') if '(' in data['maç_skor'] else 'Live'
+        top_info_line = f"⏰ {data.get('dakika')}' │ 📊 Score: {entry_score}"
+        footer_status = "⚡ Status: Bet Now!"
+
+    # B) BAHİS TİPİ
+    if data.get('corner_number'):
+        bet_type = f"TOTAL CORNERS {data.get('corner_number', '')} OVER"
+    else:
+        bet_type = template.get('bet_type', data['tahmin'])
+
+    # C) FINAL MESAJ FORMATI
     return f"""
 {main_title}
 
-🏟 {data['maç_skor']}
-🏆 {data['lig']}  
-⏰ {data['dakika']}' | 📊 Score: {data['maç_skor'].split('(')[-1].replace(')', '') if '(' in data['maç_skor'] else 'Live'}
+{top_info_line}
+🏆 {data['lig']}
+⚽ {data['maç_skor']}
 
 🎯 {bet_type}
 
-📈 Analysis: {analysis}
-💸 Stake: {template.get('stake', '3/5')}
-⚡ Time: Bet now!
+📉 Analysis: {template.get('analysis', 'Professional betting signal')}
+💰 Confidence: {template.get('stake', '3/5')}
+{footer_status}
 """
 
 def build_x_tweet(data):
-    alert_code = data.get('alert_code')
-    template = ALERT_TEMPLATES.get(alert_code, {})
     tahmin_lower = data.get('tahmin', '').lower()
     
     if data.get('corner_number') or "corner" in tahmin_lower:
         main_title = "🎯 LIVE CORNER SIGNAL 🎯"
         bet_type = f"TOTAL CORNERS {data.get('corner_number', '')} OVER"
-        analysis = "High corner frequency"
     else:
         main_title = "🎯 LIVE GOAL SIGNAL 🎯"
         bet_type = data['tahmin']
-        analysis = template.get('analysis', 'Professional signal')
     
     return f"""
 {main_title}
 
-{data['maç_skor']} | {data['dakika']}'
+{data['maç_skor']}
+{data['dakika']}'
 {data['lig']}
 
 🎯 {bet_type}
 
-📈 {analysis}
-💸 Stake: {template.get('stake', '3/5')}
+💸 Stake: 3/5
 
 #Betting #SportsBetting
 """
@@ -426,7 +470,7 @@ async def post_to_x_async(text, reply_id=None):
     return await asyncio.to_thread(post_to_x_sync, text, reply_id)
 
 # ----------------------------------------------------------------------
-# 4. HANDLER (SADECE EDİTLEME MANTIĞI)
+# 4. HANDLER (EDİT ODAKLI)
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -442,13 +486,10 @@ async def scheduled_post_task():
         await asyncio.sleep(interval)
 
 async def update_existing_message(data, signal_record):
-    """
-    🔥 TEK FONKSİYON: Sadece GÜNCELLEME (Edit) 🔥
-    """
     target_message_id = signal_record.get('target_message_id')
     tweet_id = signal_record.get('tweet_id')
     
-    # 1. TELEGRAM: Sadece Düzenle
+    # 1. TELEGRAM: Edit
     targets = get_channels_sync('target')
     for t in targets:
         try:
@@ -462,7 +503,7 @@ async def update_existing_message(data, signal_record):
         except Exception as e: 
             logger.error(f"❌ Telegram Edit error: {e}")
     
-    # 2. X (Twitter): Sadece Maç Bitince Yanıt At
+    # 2. X (Twitter): Reply (Sadece maç bitince)
     if (data.get('match_ended') or data.get('result_icon')) and tweet_id:
         x_reply = build_x_reply_tweet(data)
         if x_reply:
@@ -478,19 +519,19 @@ async def channel_handler(event):
     if not data or not data['signal_key']: return
     if data.get('alert_code') not in ALLOWED_ALERT_CODES: return
 
-    # ID İLE ARA
+    # ID CHECK
     signal_record = await asyncio.to_thread(get_signal_by_source_id, source_msg_id)
     
-    # --- DURUM A: ZATEN VAR (GÜNCELLEME) ---
+    # UPDATE
     if signal_record:
-        logger.info(f"🔄 GÜNCELLEME GELDİ (ID: {source_msg_id})")
+        logger.info(f"🔄 UPDATE (ID: {source_msg_id})")
         await update_existing_message(data, signal_record)
 
-    # --- DURUM B: YOK (YENİ SİNYAL) ---
+    # NEW SIGNAL
     else:
         if isinstance(event, events.MessageEdited): return
 
-        logger.info(f"🆕 YENİ SİNYAL (ID: {source_msg_id})")
+        logger.info(f"🆕 NEW SIGNAL (ID: {source_msg_id})")
 
         current_count = await asyncio.to_thread(get_daily_tweet_count)
         tweet_id = None
@@ -517,7 +558,7 @@ async def channel_handler(event):
             await asyncio.to_thread(record_processed_signal, data['signal_key'], target_message_id, tweet_id, source_msg_id)
 
 # ----------------------------------------------------------------------
-# 5. FLASK & ANA ÇALIŞTIRMA
+# 5. FLASK
 # ----------------------------------------------------------------------
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -541,6 +582,18 @@ async def code():
 @app.route('/health')
 def health(): return "OK", 200
 
+@app.route('/reset_limit')
+def reset_limit():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE daily_stats SET tweet_count = 0 WHERE date = CURRENT_DATE;")
+            conn.commit()
+        return "✅ Counter Reset!"
+    except: return "Error"
+    finally:
+        if conn: conn.close()
+
 async def main():
     try:
         await asyncio.to_thread(init_db_sync)
@@ -558,7 +611,7 @@ async def main():
         user_client.add_event_handler(channel_handler, events.NewMessage(incoming=True, chats=source_ids))
         user_client.add_event_handler(channel_handler, events.MessageEdited(chats=source_ids))
         
-        logger.info(f"📡 Listening on channels (NEW + EDITED): {source_ids}")
+        logger.info(f"📡 Bot Ready (Source ID: {source_ids})")
         
         asyncio.create_task(scheduled_post_task())
         await user_client.run_until_disconnected()
