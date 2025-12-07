@@ -42,8 +42,9 @@ except Exception as e:
 
 # --- AYARLAR ---
 ALLOWED_ALERT_CODES = {'17', '41', '32', '48', '1', '21'} 
-DAILY_TWEET_LIMIT = 9999 # LİMİTSİZ MOD
+DAILY_TWEET_LIMIT = 999999 # SONSUZ MOD (Limit kaldırıldı)
 
+# Linkler güncellendi
 SCHEDULED_MESSAGE = """
 ✅ OUR SPONSOR SITES; 
 
@@ -52,16 +53,17 @@ SCHEDULED_MESSAGE = """
 💯 You can reach us to join the VIP group after making your investment 👇
 
 🟢🟡Melbet 👉Promo Code: drpars
-https://bit.ly/drparsbet
+https://refpa3665.com/L?tag=d_728751m_45415c_&site=728751&ad=45415
 
 🔴🔵1xbet 👉Promo Code: drparsbet
-bit.ly/3fAja06
+https://reffpa.com/L?tag=d_1868215m_97c_&site=1868215&ad=97
 """
 
+# Butonlar güncellendi ve renk emojileri eklendi
 BETTING_BUTTONS = [
     [
-        Button.url("JOIN MELBET (drpars)", "https://bit.ly/drparsbet"),
-        Button.url("JOIN 1XBET (drparsbet)", "http://bit.ly/3fAja06")
+        Button.url("🟡 JOIN MELBET (drpars)", "https://refpa3665.com/L?tag=d_728751m_45415c_&site=728751&ad=45415"),
+        Button.url("🔵 JOIN 1XBET (drparsbet)", "https://reffpa.com/L?tag=d_1868215m_97c_&site=1868215&ad=97")
     ]
 ]
 
@@ -191,7 +193,7 @@ def record_processed_signal(signal_key, target_message_id, tweet_id, source_mess
         if conn: conn.close()
 
 def get_daily_tweet_count():
-    # Limitsiz olduğu için her zaman 0 döndür
+    # SONSUZ MOD: Her zaman 0 döndürür, böylece limit kontrolüne takılmaz.
     return 0
 
 def increment_daily_tweet_count():
@@ -216,12 +218,11 @@ def get_channels_sync(t):
 def extract_bet_data(message_text):
     data = {}
     
-    # 1. TEMİZLİK (GELİŞTİRİLDİ)
-    # Stadyum ikonunun yanındaki skorları koru, sadece değişkeni temizle
+    # 1. TEMİZLİK
     cleaned_text = re.sub(r'🏟\s*[\d\s\-]+', '🏟', message_text)
     cleaned_text = re.sub(r'^\s*\d+\s*-\s*\d+.*$', '', cleaned_text, flags=re.MULTILINE)
     
-    # HEADER SCORE (Canlı Skor - Genişletilmiş Regex)
+    # HEADER SCORE
     header_score_match = re.search(r'(?:🏟|⚽|🟢 LIVE UPDATE 🟢\s*)\s*(\d+\s*-\s*\d+)', message_text)
     if not header_score_match:
         header_score_match = re.search(r'^\s*(\d+\s*-\s*\d+)', message_text, re.MULTILINE)
@@ -252,12 +253,11 @@ def extract_bet_data(message_text):
     dakika_match = re.search(r'⏰\s*(\d+)\s*', cleaned_text)
     data['dakika'] = dakika_match.group(1).strip() if dakika_match else None
     
-    # TAHMİN (GELİŞMİŞ KORNER KONTROLÜ)
+    # TAHMİN
     tahmin_match = re.search(r'❗[️\s]*(.*?)\n', cleaned_text)
     if tahmin_match:
         tahmin_text = tahmin_match.group(1).strip()
         
-        # Kelime VE Sayı kontrolü
         is_corner_word = "corner" in tahmin_text.lower() or "korner" in tahmin_text.lower()
         corner_match = re.search(r'(\d+\.?\d*)\s*(üst|over|alt|under)', tahmin_text, re.IGNORECASE)
         
@@ -282,7 +282,7 @@ def extract_bet_data(message_text):
     result_match = re.search(r'([✅❌])', message_text) 
     data['result_icon'] = result_match.group(1) if result_match else None
 
-    # LIVE UPDATE TESPİTİ (GÜÇLENDİRİLDİ)
+    # LIVE UPDATE TESPİTİ
     live_title = re.search(r'🟢 LIVE UPDATE 🟢', message_text)
     live_score_match = re.search(r'⏰\s*(\d+)\s*⚽[️\s]*(\d+\s*-\s*\d+)', cleaned_text)
     
@@ -449,7 +449,7 @@ async def post_to_x_async(text, reply_id=None):
     return await asyncio.to_thread(post_to_x_sync, text, reply_id)
 
 # ----------------------------------------------------------------------
-# 4. HANDLER (HATA YÖNETİMİ GÜÇLENDİRİLDİ)
+# 4. HANDLER
 # ----------------------------------------------------------------------
 
 async def scheduled_post_task():
@@ -468,7 +468,7 @@ async def update_existing_message(data, signal_record):
     target_message_id = signal_record.get('target_message_id')
     tweet_id = signal_record.get('tweet_id')
     
-    # 1. TELEGRAM (HATA YÖNETİMLİ)
+    # 1. TELEGRAM
     targets = get_channels_sync('target')
     for t in targets:
         try:
