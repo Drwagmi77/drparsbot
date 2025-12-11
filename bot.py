@@ -12,6 +12,8 @@ from flask import Flask, jsonify, request, redirect, session, render_template_st
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 from asgiref.wsgi import WsgiToAsgi
+from dotenv import load_dotenv
+load_dotenv()
 
 # ----------------------------------------------------------------------
 # 1. ORTAM DEĞİŞKENLERİ
